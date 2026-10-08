@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches the green of the your_vpn logo so the adaptive icon's masked ring blends in. -->
+    <color name="ic_launcher_background">#FF77BA51</color>
+</resources>

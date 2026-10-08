@@ -1,0 +1,797 @@
+package org.olcbox.app.ui.activities
+
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.net.VpnService
+import android.widget.Toast
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.ActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.launch
+import org.olcbox.app.data.share.ConfigShareService
+import org.olcbox.app.update.AndroidUpdateSettingsStore
+import org.olcbox.app.update.AppUpdateInfo
+import org.olcbox.app.update.AppUpdateSettings
+import org.olcbox.app.update.AppUpdateService
+import org.olcbox.app.update.AndroidUpdateInstaller
+import org.olcbox.app.update.identity
+import org.olcbox.app.update.isDownloaded
+import org.olcbox.app.update.isUpdateCheckDue
+import org.olcbox.app.update.shouldShowOffer
+import org.olcbox.app.ui.OlcboxAppContent
+import org.olcbox.app.ui.components.ApplicationUpdateOfferSheet
+import org.olcbox.app.ui.components.VkTurnLinkPromptDialog
+import org.olcbox.app.ui.features.home.HomeScreenViewModel
+import org.olcbox.app.ui.features.locations.LocationViewModel
+import org.olcbox.app.ui.navigation.AppScreen
+import org.olcbox.app.vpn.AndroidConnectionMode
+import org.olcbox.app.vpn.AndroidSplitTunnelList
+import org.olcbox.app.vpn.AndroidSplitTunnelMode
+import org.olcbox.app.vpn.AndroidVpnManager
+
+@Composable
+fun AndroidMainScreen(
+    viewModel: HomeScreenViewModel,
+    locationViewModel: LocationViewModel,
+    vpnManager: AndroidVpnManager,
+    appUpdateService: AppUpdateService? = null
+) {
+
+    var currentScreenRoute by rememberSaveable { mutableStateOf("home") }
+    var currentLocationId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val currentScreen: AppScreen =
+        when (currentScreenRoute) {
+            "location_settings" -> AppScreen.LocationSettings(currentLocationId)
+            else -> AppScreen.Home
+        }
+
+    val navigate: (AppScreen) -> Unit = { screen ->
+        when (screen) {
+            AppScreen.Home -> {
+                currentScreenRoute = "home"
+                currentLocationId = null
+            }
+            is AppScreen.LocationSettings -> {
+                currentScreenRoute = "location_settings"
+                currentLocationId = screen.locationId
+            }
+        }
+    }
+
+    val context = LocalContext.current
+    val s = org.olcbox.app.ui.i18n.LocalStrings.current
+    val scope = rememberCoroutineScope()
+    val connectionMode by vpnManager.connectionMode.collectAsState()
+    val proxySettings by vpnManager.proxySettings.collectAsState()
+    val splitTunnelSettings by vpnManager.splitTunnelSettings.collectAsState()
+    val dynamicThemeEnabled by vpnManager.dynamicThemeEnabled.collectAsState()
+    val lightThemeEnabled by vpnManager.lightThemeEnabled.collectAsState()
+    val hwid by vpnManager.hwid.collectAsState()
+    val routing by vpnManager.routing.collectAsState()
+    val routingProfilesState by vpnManager.routingProfiles.collectAsState()
+    val geoUpdateStatus by vpnManager.geoUpdateStatus.collectAsState()
+    val trafficSettings by vpnManager.trafficSettings.collectAsState()
+    val appBehavior by vpnManager.appBehavior.collectAsState()
+    val telegramProxyState by vpnManager.telegramProxyState.collectAsState()
+    val language by vpnManager.language.collectAsState()
+    val installedApps by vpnManager.installedApps.collectAsState()
+    val homeState by viewModel.state.collectAsState()
+    val logs by viewModel.logs.collectAsState()
+    // Live throughput for the optional Home speed line: shown only when the toggle is on AND connected.
+    val liveSpeed by org.olcbox.app.vpn.service.OlcboxVpnState.speed.collectAsState()
+    val isVpnConnected by org.olcbox.app.vpn.service.OlcboxVpnState.isConnected.collectAsState()
+    val pendingLogSaveCallbacks = remember {
+        mutableStateOf<Pair<(String) -> Unit, (String) -> Unit>?>(null)
+    }
+    val pendingVpnAction = remember {
+        mutableStateOf<PendingVpnPermissionAction?>(null)
+    }
+    // Persist / restore last ping results across app restarts (AppBehaviorSettings.savePingResults).
+    // Keyed on the toggle: settings load async, so when it flips on we seed the saved results (once)
+    // and route future ping-pass completions back into settings; when off we stop and clear them.
+    val pingsSeeded = remember { mutableStateOf(false) }
+    LaunchedEffect(appBehavior.savePingResults) {
+        if (appBehavior.savePingResults) {
+            if (!pingsSeeded.value && appBehavior.lastPingResults.isNotEmpty()) {
+                locationViewModel.seedPings(appBehavior.lastPingResults)
+            }
+            pingsSeeded.value = true
+            locationViewModel.onPingsCompleted = { results ->
+                vpnManager.setAppBehavior(vpnManager.appBehavior.value.copy(lastPingResults = results))
+            }
+        } else {
+            locationViewModel.onPingsCompleted = null
+            if (vpnManager.appBehavior.value.lastPingResults.isNotEmpty()) {
+                vpnManager.setAppBehavior(vpnManager.appBehavior.value.copy(lastPingResults = emptyMap()))
+            }
+        }
+    }
+    var isAppSettingsOpen by remember { mutableStateOf(false) }
+    var appSettingsInitialRoute by remember { mutableStateOf(AppSettingsInitialRoute.Hub) }
+    var shareSheetPayload by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var splitTunnelRestartPending by remember { mutableStateOf(false) }
+    val updateSettingsStore = remember(context) {
+        AndroidUpdateSettingsStore(context)
+    }
+    val updateInstaller = remember(context, vpnManager) {
+        AndroidUpdateInstaller(context) {
+            vpnManager.subscriptionFetchProxy()
+        }
+    }
+    var updateSettings by remember { mutableStateOf(AppUpdateSettings()) }
+    var updateStatusText by remember { mutableStateOf<String?>(null) }
+    var updateDownloadProgress by remember { mutableStateOf<Float?>(null) }
+    var updateOffer by remember { mutableStateOf<AppUpdateInfo?>(null) }
+    // Drives the persistent "update app" banner above the nav bar (independent of the offer sheet,
+    // which the user can dismiss while a newer release still exists).
+    var updateAvailable by remember { mutableStateOf<AppUpdateInfo?>(null) }
+    // The banner lives only in memory, so the first check of every launch must really run — gating it
+    // by the interval hid the banner after a restart until the interval ran out.
+    var updateCheckedThisLaunch by remember { mutableStateOf(false) }
+    var relaunchAfterInstall by remember { mutableStateOf(false) }
+    val subscriptionShareItems = locationViewModel.locations.toList()
+        .mapNotNull { item ->
+            val url = item.subscriptionUrl
+                ?.trim()
+                ?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
+                ?: return@mapNotNull null
+            url to item
+        }
+        .groupBy({ it.first }, { it.second })
+        .entries
+        .sortedBy { it.key }
+        .map { (url, items) ->
+            val metadata = items.firstNotNullOfOrNull { it.metadata?.subscription }
+            org.olcbox.app.data.share.SubscriptionShareItem(
+                url = url,
+                name = metadata?.name?.takeIf { it.isNotBlank() }
+                    ?: items.first().fullName,
+                updateIntervalHours = metadata?.updateIntervalHours,
+                lastRefreshAtEpochMs = metadata?.lastRefreshAtEpochMs,
+                locationCount = items.size,
+                supportUrl = metadata?.supportUrl,
+                webPageUrl = metadata?.webPageUrl,
+                announce = metadata?.announce
+            )
+        }
+
+    val updateInstallLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result: ActivityResult ->
+        if (relaunchAfterInstall && result.resultCode == Activity.RESULT_OK) {
+            relaunchAfterInstall = false
+            updateInstaller.relaunchIntent()?.let { intent ->
+                runCatching { context.startActivity(intent) }
+            }
+        } else {
+            relaunchAfterInstall = false
+        }
+    }
+
+    fun markSplitTunnelChanged() {
+        if (homeState.isVpnConnected && connectionMode == AndroidConnectionMode.Tun) {
+            splitTunnelRestartPending = true
+        }
+    }
+
+    fun applyPendingSplitTunnelRestart() {
+        if (splitTunnelRestartPending && homeState.isVpnConnected && connectionMode == AndroidConnectionMode.Tun) {
+            viewModel.restartVpnIfRunning()
+        }
+        splitTunnelRestartPending = false
+    }
+
+    suspend fun saveUpdateSettings(settings: AppUpdateSettings) {
+        val normalized = settings.normalized()
+        updateSettings = normalized
+        updateSettingsStore.save(normalized)
+    }
+
+    fun showUpdateResult(info: AppUpdateInfo, manual: Boolean) {
+        if (info.isDownloaded(updateSettings)) {
+            updateOffer = null
+            updateStatusText = s.latestAlreadyDownloaded(s.releaseChannelLabel)
+        } else if (info.isUpdateAvailable) {
+            // Auto checks only raise the banner; the full offer sheet pops on a manual check (or when
+            // the user taps the banner). Avoids a sheet ambushing the user on every launch.
+            if (manual) updateOffer = info
+            updateStatusText = s.channelUpdateAvailable(s.releaseChannelLabel, info.version)
+        } else {
+            updateOffer = null
+            updateStatusText = s.upToDate
+        }
+    }
+
+    fun checkUpdate(manual: Boolean) {
+        val service = appUpdateService
+        if (service == null) {
+            updateStatusText = s.updateServiceUnavailable
+            return
+        }
+        scope.launch {
+            val previousSettings = updateSettings
+            val checkStartedAt = kotlin.time.Clock.System.now().toEpochMilliseconds()
+            if (!manual && updateCheckedThisLaunch && !previousSettings.isUpdateCheckDue(checkStartedAt)) return@launch
+
+            updateStatusText = s.checkingChannel(s.releaseChannelLabel.lowercase())
+            val result = service.check(
+                previousSettings.channel,
+                vpnManager.subscriptionFetchProxy()
+            )
+            val checkedAt = kotlin.time.Clock.System.now().toEpochMilliseconds()
+            val checkedSettings = previousSettings.copy(lastCheckAtEpochMs = checkedAt).normalized()
+            saveUpdateSettings(checkedSettings)
+            result.fold(
+                onSuccess = { info ->
+                    updateCheckedThisLaunch = true
+                    // The banner reflects whether a newer, not-yet-downloaded release exists — shown
+                    // regardless of the postpone/"should offer" logic that only gates the sheet.
+                    updateAvailable = info.takeIf { it.isUpdateAvailable && !it.isDownloaded(checkedSettings) }
+                    if (manual || info.shouldShowOffer(previousSettings, checkedAt)) {
+                        showUpdateResult(info, manual)
+                    } else {
+                        updateOffer = null
+                        updateStatusText = null
+                    }
+                },
+                onFailure = { error ->
+                    updateStatusText = error.message ?: s.updateCheckFailed
+                }
+            )
+        }
+    }
+
+    fun downloadUpdate(info: AppUpdateInfo) {
+        scope.launch {
+            if (!updateInstaller.canRequestPackageInstalls()) {
+                updateInstaller.openUnknownSourcesSettings()
+                updateStatusText = s.allowInstallUpdates
+                Toast.makeText(context, updateStatusText, Toast.LENGTH_LONG).show()
+                return@launch
+            }
+
+            updateDownloadProgress = 0f
+            updateStatusText = s.downloadingAsset(info.asset.name)
+            // Prefer a binary delta (small patch applied to the installed APK) when one is published;
+            // transparently falls back to a full download, and signature-verifies either way.
+            val result = updateInstaller.resolveUpdateApk(info) { progress ->
+                updateDownloadProgress = progress
+            }
+            val file = result.getOrElse { error ->
+                updateStatusText = s.downloadFailed(error.message ?: s.updateCheckFailed)
+                updateDownloadProgress = null
+                Toast.makeText(context, updateStatusText, Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            updateStatusText = s.installingAsset(info.asset.name)
+            saveUpdateSettings(
+                updateSettings.copy(
+                    lastSeenUpdateVersion = info.identity(),
+                    lastDownloadedUpdateVersion = info.identity()
+                )
+            )
+            updateOffer = null
+            updateAvailable = null
+            updateDownloadProgress = null
+            relaunchAfterInstall = true
+            updateInstallLauncher.launch(updateInstaller.installIntent(file))
+        }
+    }
+
+    fun postponeUpdate(info: AppUpdateInfo) {
+        scope.launch {
+            saveUpdateSettings(updateSettings.copy(lastSeenUpdateVersion = info.identity()))
+            updateOffer = null
+        }
+    }
+
+    LaunchedEffect(appUpdateService) {
+        val loaded = updateSettingsStore.load()
+        updateSettings = loaded
+        // Launch check, then re-check while the app stays open; checkUpdate itself skips ticks
+        // until the chosen interval (1–24 h) has passed, so a tick costs nothing.
+        while (appUpdateService != null) {
+            checkUpdate(manual = false)
+            kotlinx.coroutines.delay(AppUpdateSettings.CHECK_TICK_MS)
+        }
+    }
+
+    fun reloadLocationsAfterImport(onComplete: () -> Unit = {}) {
+        locationViewModel.loadLocations {
+            viewModel.loadCurrentConfig(onComplete)
+        }
+    }
+
+    val vpnRequestLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result: ActivityResult ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            when (val action = pendingVpnAction.value) {
+                PendingVpnPermissionAction.Toggle -> viewModel.ToggleVpn()
+                is PendingVpnPermissionAction.RestartWithMode -> {
+                    vpnManager.selectConnectionMode(action.mode)
+                    viewModel.restartVpnIfRunning()
+                }
+                null -> Unit
+            }
+        }
+        pendingVpnAction.value = null
+    }
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        org.olcbox.app.vpn.service.OlcboxVpnState.addLog("import: file picker result uri=$uri")
+        if (uri == null) {
+            Toast.makeText(context, s.noFileSelected, Toast.LENGTH_SHORT).show()
+            return@rememberLauncherForActivityResult
+        }
+        viewModel.onFileSelected(
+            fileSource = uri,
+            onComplete = { reloadLocationsAfterImport() },
+            onError = { msg -> Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
+        )
+    }
+
+    val qrScannerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result: ActivityResult ->
+        if (result.resultCode != Activity.RESULT_OK) return@rememberLauncherForActivityResult
+
+        val rawText = result.data?.getStringExtra(QrScannerActivity.EXTRA_QR_TEXT)
+            ?.trim()
+            .orEmpty()
+
+        if (rawText.isBlank()) return@rememberLauncherForActivityResult
+
+        viewModel.onImportFullConfig(
+            rawText = rawText,
+            onComplete = {
+                reloadLocationsAfterImport {
+                    Toast.makeText(context, s.qrImported, Toast.LENGTH_SHORT).show()
+                }
+            },
+            onError = { msg -> Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
+        )
+    }
+
+    val logSaveLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri: Uri? ->
+        val callbacks = pendingLogSaveCallbacks.value
+        pendingLogSaveCallbacks.value = null
+        if (uri == null || callbacks == null) return@rememberLauncherForActivityResult
+
+        viewModel.onSaveLogsToFile(
+            target = uri,
+            onSaved = callbacks.first,
+            onError = callbacks.second
+        )
+    }
+
+    var autoConnectTried by remember { mutableStateOf(false) }
+    LaunchedEffect(appBehavior.autoConnectOnLaunch, homeState.canStartVpn) {
+        if (!autoConnectTried &&
+            appBehavior.autoConnectOnLaunch &&
+            homeState.canStartVpn &&
+            !homeState.isVpnConnected &&
+            !homeState.isVpnLoading
+        ) {
+            autoConnectTried = true
+            val prepIntent = if (connectionMode == AndroidConnectionMode.Tun) {
+                VpnService.prepare(context)
+            } else {
+                null
+            }
+            if (prepIntent != null) {
+                pendingVpnAction.value = PendingVpnPermissionAction.Toggle
+                vpnRequestLauncher.launch(prepIntent)
+            } else {
+                viewModel.ToggleVpn()
+            }
+        }
+    }
+
+    fun navigateHomeFromLocationSettings() {
+        viewModel.loadCurrentConfig()
+        navigate(AppScreen.Home)
+    }
+
+    BackHandler(enabled = currentScreen is AppScreen.LocationSettings) {
+        navigateHomeFromLocationSettings()
+    }
+
+    androidx.compose.runtime.CompositionLocalProvider(
+        org.olcbox.app.ui.features.locations.components.LocalPingResultDisplay provides appBehavior.pingResultDisplay,
+        org.olcbox.app.ui.features.locations.components.LocalShowSubscriptionExpiry provides appBehavior.showSubscriptionExpiry,
+        org.olcbox.app.ui.features.locations.components.LocalShowSubscriptionAliveCount provides appBehavior.showSubscriptionAliveCount,
+        org.olcbox.app.ui.features.locations.components.LocalShowSubscriptionDescription provides appBehavior.showSubscriptionDescription,
+        org.olcbox.app.ui.features.locations.components.LocalHideEndpointWhenDescription provides appBehavior.hideEndpointWhenDescription,
+        org.olcbox.app.ui.features.locations.components.LocalConnectedSpeed provides
+            (if (appBehavior.showSpeedOnHome && isVpnConnected) liveSpeed else null)
+    ) {
+    OlcboxAppContent(
+        homeViewModel = viewModel,
+        locationViewModel = locationViewModel,
+        currentScreen = currentScreen,
+        onNavigate = navigate,
+        onToggleClick = {
+            val prepIntent = if (connectionMode == AndroidConnectionMode.Tun) {
+                VpnService.prepare(context)
+            } else {
+                null
+            }
+            if (prepIntent != null) {
+                pendingVpnAction.value = PendingVpnPermissionAction.Toggle
+                vpnRequestLauncher.launch(prepIntent)
+            } else {
+                viewModel.ToggleVpn()
+            }
+        },
+        onImportFileRequested = {
+            org.olcbox.app.vpn.service.OlcboxVpnState.addLog("import: launching file picker")
+            runCatching { filePickerLauncher.launch(arrayOf("*/*")) }
+                .onFailure {
+                    org.olcbox.app.vpn.service.OlcboxVpnState.addLog("import: launch failed: ${it.message}")
+                    Toast.makeText(context, s.cannotOpenFilePicker(it.message ?: ""), Toast.LENGTH_LONG).show()
+                }
+        },
+        onImportFromClipboardRequested = { onImported, onError ->
+            viewModel.onPasteFromClipboard(
+                onComplete = {
+                    reloadLocationsAfterImport(onImported)
+                },
+                onError = onError
+            )
+        },
+        onScanQrRequested = {
+            qrScannerLauncher.launch(Intent(context, QrScannerActivity::class.java))
+        },
+        onCopyConfigRequested = {
+            viewModel.onCopyFullConfigClicked()
+        },
+        onShareLocationRequested = { config ->
+            // Share our universal yptun:// link (carries the whole inbound incl. proxy + toggles).
+            shareSheetPayload = s.locationQr to org.olcbox.app.data.share.YptunInboundCodec.compose(config)
+        },
+        onSaveLogsRequested = { onSaved, onError ->
+            pendingLogSaveCallbacks.value = onSaved to onError
+            logSaveLauncher.launch(viewModel.suggestedLogsFileName())
+        },
+        showAppSettingsButton = true,
+        showSplitTunnelingButton = false,
+        canScanQr = true,
+        confirmBeforeDelete = appBehavior.confirmBeforeDelete,
+        allowVpsAutoInstall = appBehavior.allowVpsAutoInstall,
+        pingParallelism = appBehavior.effectivePingParallelism(),
+        updateAvailable = updateAvailable != null,
+        onUpdateClick = { updateAvailable?.let { updateOffer = it } },
+        collapsedGroups = appBehavior.collapsedSubscriptionGroups,
+        pinnedGroups = appBehavior.pinnedSubscriptionGroups,
+        pingSortedGroups = appBehavior.pingSortedSubscriptionGroups,
+        pingSortDescendingGroups = appBehavior.pingSortDescendingSubscriptionGroups,
+        pinnedCustomLocations = appBehavior.pinnedCustomLocations,
+        customLocationsPingSorted = appBehavior.customLocationsPingSorted,
+        customLocationsPingSortDescending = appBehavior.customLocationsPingSortDescending,
+        twoColumns = appBehavior.twoColumnLayout,
+        showAutoButton = appBehavior.showAutoButton,
+        onToggleCustomLocationPinned = { id ->
+            val current = appBehavior.pinnedCustomLocations
+            val updated = if (id in current) current - id else current + id
+            vpnManager.setAppBehavior(appBehavior.copy(pinnedCustomLocations = updated))
+        },
+        onToggleCustomLocationsPingSort = {
+            // Cycle: off → ascending → descending → off.
+            val updated = when {
+                !appBehavior.customLocationsPingSorted -> appBehavior.copy(
+                    customLocationsPingSorted = true,
+                    customLocationsPingSortDescending = false,
+                )
+                !appBehavior.customLocationsPingSortDescending ->
+                    appBehavior.copy(customLocationsPingSortDescending = true)
+                else -> appBehavior.copy(
+                    customLocationsPingSorted = false,
+                    customLocationsPingSortDescending = false,
+                )
+            }
+            vpnManager.setAppBehavior(updated)
+        },
+        onToggleGroupCollapsed = { key ->
+            val current = appBehavior.collapsedSubscriptionGroups
+            val updated = if (key in current) current - key else current + key
+            vpnManager.setAppBehavior(appBehavior.copy(collapsedSubscriptionGroups = updated))
+        },
+        onToggleGroupPinned = { key ->
+            val current = appBehavior.pinnedSubscriptionGroups
+            val updated = if (key in current) current - key else current + key
+            vpnManager.setAppBehavior(appBehavior.copy(pinnedSubscriptionGroups = updated))
+        },
+        onToggleGroupPingSort = { key ->
+            // Cycle: off → ascending → descending → off.
+            val sorted = appBehavior.pingSortedSubscriptionGroups
+            val desc = appBehavior.pingSortDescendingSubscriptionGroups
+            val updated = when {
+                key !in sorted -> appBehavior.copy(
+                    pingSortedSubscriptionGroups = sorted + key,
+                    pingSortDescendingSubscriptionGroups = desc - key,
+                )
+                key !in desc -> appBehavior.copy(pingSortDescendingSubscriptionGroups = desc + key)
+                else -> appBehavior.copy(
+                    pingSortedSubscriptionGroups = sorted - key,
+                    pingSortDescendingSubscriptionGroups = desc - key,
+                )
+            }
+            vpnManager.setAppBehavior(updated)
+        },
+        customGroups = appBehavior.customGroups,
+        onCreateFolder = { name, memberKeys ->
+            val folder = org.olcbox.app.data.model.CustomGroup(
+                id = "folder_${kotlin.random.Random.nextInt(100_000, 999_999)}",
+                name = name,
+                members = memberKeys
+            )
+            // New members may already sit in another folder — keep each item in only one folder.
+            val cleaned = appBehavior.customGroups.map { g -> g.copy(members = g.members - memberKeys.toSet()) }
+            vpnManager.setAppBehavior(appBehavior.copy(customGroups = cleaned + folder))
+        },
+        onRenameFolder = { id, name ->
+            val updated = appBehavior.customGroups.map { if (it.id == id) it.copy(name = name) else it }
+            vpnManager.setAppBehavior(appBehavior.copy(customGroups = updated))
+        },
+        onDeleteFolder = { id ->
+            vpnManager.setAppBehavior(appBehavior.copy(customGroups = appBehavior.customGroups.filterNot { it.id == id }))
+        },
+        onAddToFolder = { id, memberKeys ->
+            val keySet = memberKeys.toSet()
+            val updated = appBehavior.customGroups.map { g ->
+                when (g.id) {
+                    // Add to the target folder (de-duplicated)…
+                    id -> g.copy(members = (g.members + memberKeys).distinct())
+                    // …and remove from any other folder so an item lives in a single folder.
+                    else -> g.copy(members = g.members - keySet)
+                }
+            }
+            vpnManager.setAppBehavior(appBehavior.copy(customGroups = updated))
+        },
+        onRemoveFromFolder = { memberKeys ->
+            val keySet = memberKeys.toSet()
+            val updated = appBehavior.customGroups.map { it.copy(members = it.members - keySet) }
+            vpnManager.setAppBehavior(appBehavior.copy(customGroups = updated))
+        },
+        onToggleFolderPinned = { id ->
+            val updated = appBehavior.customGroups.map { if (it.id == id) it.copy(pinned = !it.pinned) else it }
+            vpnManager.setAppBehavior(appBehavior.copy(customGroups = updated))
+        },
+        onToggleFolderCollapsed = { id ->
+            val updated = appBehavior.customGroups.map { if (it.id == id) it.copy(collapsed = !it.collapsed) else it }
+            vpnManager.setAppBehavior(appBehavior.copy(customGroups = updated))
+        },
+        onAppSettingsClick = {
+            appSettingsInitialRoute = AppSettingsInitialRoute.Hub
+            vpnManager.refreshInstalledApps()
+            isAppSettingsOpen = true
+        },
+        onSplitTunnelingClick = {
+            appSettingsInitialRoute = AppSettingsInitialRoute.SplitTunneling
+            vpnManager.refreshInstalledApps()
+            isAppSettingsOpen = true
+        },
+        onUnlockExperimental = {
+            if (!appBehavior.experimentalUnlocked) {
+                vpnManager.setAppBehavior(appBehavior.copy(experimentalUnlocked = true))
+                Toast.makeText(context, s.experimentalUnlocked, Toast.LENGTH_LONG).show()
+            }
+        }
+    )
+    }
+
+    shareSheetPayload?.let { (title, payload) ->
+        AndroidConfigShareSheet(
+            title = title,
+            payload = payload,
+            onDismiss = { shareSheetPayload = null }
+        )
+    }
+
+    // Manual VK captcha for a VK-TURN connect: the service's CaptchaPresenter publishes the local
+    // captcha-proxy URL; solving it in this WebView lets the TURN relay come up.
+    val vkCaptchaUrl by org.olcbox.app.vpn.service.OlcboxVpnState.vkCaptchaUrl.collectAsState()
+    vkCaptchaUrl?.let { url ->
+        org.olcbox.app.ui.components.VkCaptchaDialog(
+            url = url,
+            onDismiss = { org.olcbox.app.vpn.service.OlcboxVpnState.setVkCaptchaUrl(null) }
+        )
+    }
+
+    homeState.vkTurnLinkPrompt?.let { prompt ->
+        VkTurnLinkPromptDialog(
+            locationName = prompt.locationName,
+            onLater = { viewModel.dismissVkTurnLinkPrompt() },
+            onNext = { link -> viewModel.submitVkTurnLink(prompt.storageId, link) }
+        )
+    }
+
+    updateOffer?.let { info ->
+        ApplicationUpdateOfferSheet(
+            info = info,
+            downloadProgress = updateDownloadProgress,
+            onLater = { postponeUpdate(info) },
+            onDownload = { downloadUpdate(info) },
+            onManual = {
+                runCatching {
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW, Uri.parse(info.htmlUrl))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }
+                updateOffer = null
+            }
+        )
+    }
+
+    if (isAppSettingsOpen) {
+        AppSettingsSheet(
+            initialRoute = appSettingsInitialRoute,
+            selectedMode = connectionMode,
+            proxySettings = proxySettings,
+            splitTunnelSettings = splitTunnelSettings,
+            installedApps = installedApps,
+            logs = logs,
+            dynamicThemeEnabled = dynamicThemeEnabled,
+            lightThemeEnabled = lightThemeEnabled,
+            hwid = hwid,
+            routing = routing,
+            onRoutingChanged = vpnManager::setRouting,
+            routingProfilesState = routingProfilesState,
+            geoUpdateStatus = geoUpdateStatus,
+            onRoutingProfileSaved = { vpnManager.saveRoutingProfile(it) },
+            onRoutingProfileDeleted = vpnManager::deleteRoutingProfile,
+            onGlobalRoutingProfileChanged = vpnManager::setGlobalRoutingProfile,
+            onRoutingProfileLinkImported = vpnManager::importRoutingProfileLink,
+            onGeoSourcesChanged = vpnManager::setGeoSources,
+            onUpdateGeoNow = vpnManager::updateGeoAssetsNow,
+            trafficSettings = trafficSettings,
+            onTrafficChanged = vpnManager::setTrafficSettings,
+            appBehavior = appBehavior,
+            telegramProxyState = telegramProxyState,
+            onAppBehaviorChanged = { newBehavior ->
+                val expiryJustEnabled = (newBehavior.showSubscriptionExpiry && !appBehavior.showSubscriptionExpiry) ||
+                    (newBehavior.showSubscriptionDescription && !appBehavior.showSubscriptionDescription)
+                vpnManager.setAppBehavior(newBehavior)
+                // Turning either header toggle on refreshes every subscription right away, so the
+                // "до …" date / panel description appear without waiting for the next poll.
+                if (expiryJustEnabled) {
+                    viewModel.refreshSubscriptionExpiryNow()
+                }
+            },
+            language = language,
+            onLanguageChanged = vpnManager::setLanguage,
+            updateSettings = updateSettings,
+            updateStatusText = updateStatusText,
+            updateDownloadProgress = updateDownloadProgress,
+            subscriptions = subscriptionShareItems,
+            enabled = !homeState.isVpnLoading,
+            isConnectionActive = homeState.isVpnConnected,
+            onDismiss = {
+                isAppSettingsOpen = false
+                applyPendingSplitTunnelRestart()
+            },
+            onCopyConfigClick = {
+                viewModel.onCopyFullConfigClicked()
+                Toast.makeText(context, s.configCopied, Toast.LENGTH_SHORT).show()
+            },
+            onSaveLogsClick = {
+                val showToast: (String) -> Unit = { message ->
+                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                }
+                pendingLogSaveCallbacks.value = showToast to showToast
+                logSaveLauncher.launch(viewModel.suggestedLogsFileName())
+            },
+            onShareLogsClick = {
+                val showToast: (String) -> Unit = { message ->
+                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                }
+                viewModel.onShareLogs(showToast, showToast)
+            },
+            onUpdateIntervalSelected = { hours ->
+                scope.launch {
+                    saveUpdateSettings(updateSettings.copy(intervalHours = hours))
+                }
+            },
+            onCheckUpdatesClick = {
+                checkUpdate(manual = true)
+            },
+            onSubscriptionShareClick = { url ->
+                shareSheetPayload = s.subscriptionQr to ConfigShareService.subscriptionQrText(url)
+            },
+            onSubscriptionRefreshClick = { url ->
+                viewModel.refreshSubscription(url) { updatedCount ->
+                    reloadLocationsAfterImport {
+                        viewModel.restartVpnIfRunning()
+                        Toast.makeText(
+                            context,
+                            if (updatedCount > 0) s.subscriptionUpdated else s.subscriptionNotUpdated,
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            },
+            onDynamicThemeChanged = vpnManager::setDynamicThemeEnabled,
+            onLightThemeChanged = vpnManager::setLightThemeEnabled,
+            onAccentColorSelected = vpnManager::setAccentColor,
+            onTextColorSelected = vpnManager::setTextColor,
+            onBackgroundColorSelected = vpnManager::setBackgroundColor,
+            onModeSelected = { mode ->
+                if (mode != connectionMode && homeState.isVpnConnected) {
+                    val prepIntent = if (mode == AndroidConnectionMode.Tun) {
+                        VpnService.prepare(context)
+                    } else {
+                        null
+                    }
+                    if (prepIntent != null) {
+                        pendingVpnAction.value = PendingVpnPermissionAction.RestartWithMode(mode)
+                        vpnRequestLauncher.launch(prepIntent)
+                    } else {
+                        vpnManager.selectConnectionMode(mode)
+                        viewModel.restartVpnIfRunning()
+                    }
+                } else if (mode != connectionMode) {
+                    vpnManager.selectConnectionMode(mode)
+                }
+            },
+            onProxySettingsSaved = { host, username, password, port ->
+                vpnManager.updateProxySettings(host, username, password, port)
+                if (homeState.isVpnConnected) {
+                    viewModel.restartVpnIfRunning()
+                }
+            },
+            onProxyPasswordRegenerated = {
+                vpnManager.regenerateProxyPassword()
+                if (homeState.isVpnConnected) {
+                    viewModel.restartVpnIfRunning()
+                }
+            },
+            onSplitTunnelModeSelected = { mode: AndroidSplitTunnelMode ->
+                vpnManager.selectSplitTunnelMode(mode)
+                markSplitTunnelChanged()
+            },
+            onSplitTunnelAppToggled = { list: AndroidSplitTunnelList, packageName: String ->
+                vpnManager.toggleSplitTunnelApp(list, packageName)
+                markSplitTunnelChanged()
+            },
+            onSplitTunnelAppsSelected = { list: AndroidSplitTunnelList, packages: Set<String> ->
+                vpnManager.setSplitTunnelApps(list, packages)
+                markSplitTunnelChanged()
+            }
+        )
+    }
+}
+
+private sealed class PendingVpnPermissionAction {
+    object Toggle : PendingVpnPermissionAction()
+    data class RestartWithMode(val mode: AndroidConnectionMode) : PendingVpnPermissionAction()
+}
+

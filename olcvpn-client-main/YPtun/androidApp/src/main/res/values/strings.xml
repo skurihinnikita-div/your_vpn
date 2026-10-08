@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Quick Settings tile -->
+    <string name="qs_tile_label">your_vpn</string>
+    <string name="qs_tile_connected">Connected</string>
+    <string name="qs_tile_connecting">Connecting…</string>
+    <string name="qs_tile_disconnected">Disconnected</string>
+
+    <!-- Home-screen widgets -->
+    <string name="widget_toggle_label">your_vpn</string>
+    <string name="widget_toggle_description">One-tap VPN toggle</string>
+    <string name="widget_status_description">VPN status, speed and server switch</string>
+    <string name="widget_prev_node">Previous server</string>
+    <string name="widget_next_node">Next server</string>
+    <string name="widget_auto">Auto (fastest server)</string>
+    <string name="widget_state_disconnected">Disconnected</string>
+    <string name="widget_state_connecting">Connecting…</string>
+    <string name="widget_state_connected">Connected</string>
+    <string name="widget_state_no_location">No server selected</string>
+    <string name="widget_config_label">Widget appearance</string>
+
+    <!-- Launcher shortcuts (also Samsung Modes & Routines app actions) -->
+    <string name="shortcut_vpn_on">Turn VPN on</string>
+    <string name="shortcut_vpn_off">Turn VPN off</string>
+    <string name="shortcut_vpn_toggle">Toggle VPN</string>
+</resources>

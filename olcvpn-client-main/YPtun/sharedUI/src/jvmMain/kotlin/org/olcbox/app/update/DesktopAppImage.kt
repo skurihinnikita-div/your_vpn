@@ -1,0 +1,109 @@
+package org.olcbox.app.update
+
+import java.nio.file.Files
+import java.nio.file.Path
+import java.security.MessageDigest
+import kotlin.io.path.exists
+import kotlin.io.path.extension
+import kotlin.io.path.isDirectory
+import kotlin.io.path.name
+
+/**
+ * The layout of an installed YPtun desktop build (a jpackage app image):
+ *
+ * - `<install>/YPtun.exe` — launcher
+ * - `<install>/app/` — the jars: the application itself, the only part that changes release to release
+ * - `<install>/runtime/` — the bundled JRE (~120 MB, essentially never changes)
+ *
+ * Delta updates patch exactly one file: the fat application jar, which carries our code AND the
+ * native cores. Everything else is either identical between releases or, if it did change, reason
+ * enough to fall back to the full installer — the release-time generator makes that call.
+ */
+internal object DesktopAppImage {
+
+    /**
+     * The jar the running app was launched from, or null when the app isn't running from an
+     * installed app image (a Gradle `run`, an IDE, a `-cp` of loose classes).
+     */
+    fun runningJar(): Path? = runCatching {
+        val source = DesktopAppImage::class.java.protectionDomain?.codeSource?.location ?: return null
+        val path = Path.of(source.toURI())
+        path.takeIf { it.exists() && !it.isDirectory() && it.extension.equals("jar", ignoreCase = true) }
+    }.getOrNull()
+
+    /**
+     * The `app/` directory of the installed image — every jar plus `YPtun.cfg`, i.e. everything a
+     * delta update touches. Null outside an installation (a Gradle `run`, an IDE, loose classes).
+     *
+     * The running jar sits in it in a packaged build; the check that it is an `app/` directory next
+     * to a `runtime/` one is what tells a real installation apart from a development run.
+     */
+    fun appDir(): Path? {
+        val jar = runningJar() ?: return null
+        val appDir = jar.parent ?: return null
+        if (!appDir.name.equals("app", ignoreCase = true)) return null
+        val installDir = appDir.parent ?: return null
+        if (!installDir.resolve("runtime").isDirectory()) return null
+        return appDir
+    }
+
+    /** The installed image's root (the directory holding the launcher), or null outside one. */
+    fun installDir(): Path? = appDir()?.parent
+
+    /** The launcher executable to restart after an update, or null when it can't be found. */
+    fun launcher(): Path? {
+        val root = installDir() ?: return null
+        val windows = System.getProperty("os.name").orEmpty().lowercase().contains("win")
+        val candidates = if (windows) {
+            listOf(root.resolve("your_vpn.exe"))
+        } else {
+            // jpackage's deb layout is /opt/yptun/{bin/YPtun, lib/{app,runtime}}, so [installDir]
+            // here is .../lib and the launcher sits one level ABOVE it — the two paths below it
+            // never matched, and a Linux delta update therefore never restarted the app.
+            listOfNotNull(
+        root.parent?.resolve("bin")?.resolve("your_vpn"),
+        root.resolve("bin").resolve("your_vpn"),
+        root.resolve("your_vpn")
+            )
+        }
+        return candidates.firstOrNull { it.exists() }
+    }
+
+    /**
+     * The app image's classpath file (`app/YPtun.cfg`) — jpackage names every jar in it by exact
+     * filename, and those names carry a content hash, so this one small file changes whenever any
+     * jar does. That makes it the cheap identity of an installed build.
+     */
+    fun classpathFile(): Path? {
+        val dir = appDir() ?: return null
+        return runCatching {
+            Files.list(dir).use { stream ->
+                stream.filter { it.name.endsWith(".cfg", ignoreCase = true) }.findFirst().orElse(null)
+            }
+        }.getOrNull()
+    }
+
+    /** Lowercase hex SHA-256 of [path]. */
+    fun sha256(path: Path): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        Files.newInputStream(path).use { input ->
+            val buffer = ByteArray(1 shl 16)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+}
+
+/**
+ * SHA-256 of what identifies this installation, or null outside an installed app image (a Gradle
+ * `run`, an IDE). A published delta bundle names the build it was generated against, so the updater
+ * can tell up front whether it fits instead of downloading it to find out — and a portable or
+ * hand-patched image no longer pulls a bundle that can only be rejected.
+ */
+fun installedDesktopFingerprint(): String? = runCatching {
+    DesktopAppImage.classpathFile()?.let(DesktopAppImage::sha256)
+}.getOrNull()

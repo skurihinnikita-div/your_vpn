@@ -1,0 +1,287 @@
+<div align="center">
+
+# YPtun
+
+### وی‌پی‌ان سریع و مقاوم در برابر سانسور · اندروید، ویندوز و لینوکس · iOS در مرحله‌ی بتا
+
+*VLESS · Reality · XHTTP روی **Xray** و **sing-box**، **Hysteria2** (QUIC)، وایرگارد مبهم‌سازی‌شده‌ی **AmneziaWG**، تونل از طریق تماس‌های **VK-TURN**، تونل DNS با **MasterDNS**، پروکسی مستقل تلگرام روی **WARP** — و **olcRTC** که ترافیک را شبیه تماس تصویری می‌کند.*
+
+<br>
+
+[![آخرین نسخه](https://img.shields.io/github/v/release/yanisplugg/olcvpn-client?style=for-the-badge&color=4c8eff&label=download)](https://github.com/yanisplugg/olcvpn-client/releases/latest)
+[![دانلودها](https://img.shields.io/github/downloads/yanisplugg/olcvpn-client/total?style=for-the-badge&color=2ea043&label=downloads)](https://github.com/yanisplugg/olcvpn-client/releases)
+[![ستاره‌ها](https://img.shields.io/github/stars/yanisplugg/olcvpn-client?style=for-the-badge&color=f0b429)](https://github.com/yanisplugg/olcvpn-client/stargazers)
+
+💎 **حمایت از پروژه** — TON یا USDT (شبکه TON):<br>
+`UQAPC9J9UY8oaYV4AwjEAYIIJMswo7qVzJDkf4pzY8kVtzJ-`
+
+![پلتفرم](https://img.shields.io/badge/platform-Android%206.0%2B-3ddc84?style=flat-square&logo=android&logoColor=white)
+![پلتفرم](https://img.shields.io/badge/platform-Windows%2010%2B-0078d4?style=flat-square&logo=windows&logoColor=white)
+![پلتفرم](https://img.shields.io/badge/platform-Linux%20.deb-fcc624?style=flat-square&logo=linux&logoColor=black)
+![پلتفرم](https://img.shields.io/badge/platform-iOS%20beta-8e8e93?style=flat-square&logo=apple&logoColor=white)
+![هسته‌ها](https://img.shields.io/badge/cores-Xray%20%2B%20sing--box-blueviolet?style=flat-square)
+![مجوز](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)
+
+<br>
+
+[Русский](README.md) · [English](README.en.md) · **فارسی** · [简体中文](README.zh.md)
+
+</div>
+
+---
+
+<div dir="rtl">
+
+## چرا YPtun؟
+
+بیشتر کلاینت‌های وی‌پی‌ان یک هسته و یک راه اتصال به شما می‌دهند. **YPtun یک جعبه‌ابزار به شما می‌دهد.** چند موتور دور زدن سانسور در یک اپ؛ وقتی یک روش مسدود شد، روش دیگری را انتخاب می‌کنید و کارتان را ادامه می‌دهید.
+
+> **نقطه‌ی قوت، انعطاف‌پذیری است.** Xray و sing-box با همه‌ی پروتکل‌ها و ترنسپورت‌های رایج، وایرگارد مبهم‌سازی‌شده با AmneziaWG، تونل‌زنی از طریق تماس‌های واقعی (VK-TURN و olcRTC)، تونل DNS با MasterDNS، ایمپورت تقریباً هر چیزی و پروفایل‌های مسیریابی سازگار با Happ. یک مسیر را ببندند، چند مسیر دیگر کنارش هست.
+
+> ساخته‌شده برای جاهایی که اینترنت مقاومت می‌کند — برای ایران، روسیه و هر کشوری که سایت‌ها بی‌خبر ناپدید می‌شوند.
+
+> **اکنون روی ویندوز** — نصب‌کننده و نسخه‌ی قابل‌حمل در یک فایل `.exe`، برای x64 و ARM64 بومی. همان اپ و همان موتورهای گوشی: اشتراک‌ها، پروفایل‌های مسیریابی، آبشاری، VK-TURN، olcRTC، MasterDNS، Trust Tunnel. نسخه‌ی لینوکس در دست ساخت است.
+
+---
+
+## تازه‌ها در نسخه ۳٫۶٫۰
+
+| | |
+|---|---|
+| ⚠️ **olcRTC هسته‌ی قدیمی (legacy) می‌شود** | فعلاً مثل قبل کار می‌کند، اما دیگر توسعه نمی‌یابد و در نسخه‌های آینده حذف خواهد شد. از الان جایگزین انتخاب کنید: VK-TURN، OpenFlux، MasterDNS یا Xray/sing-box. |
+| **فهرست سرورهای رایگان** | اندروید و دسکتاپ: دریافت با یک دکمه، بررسی خودکار در دسترس بودن و حذف سرورهای از کار افتاده؛ در ویندوز و لینوکس مستقیم از سینی سیستم. با تشکر از @Zamotashka (#49، #50). |
+| **رابط دوستونه‌ی دسکتاپ** | دکمه، زمان‌سنج و وضعیت در چپ، اشتراک‌ها و سرورها در راست؛ پنجره به‌طور پیش‌فرض عریض است. |
+| **OpenFlux 0.0.3** | ترنسپورت‌های جدید Mail.ru و cups.online، فشرده‌سازی پیش‌فرض. ⚠️ نود قدیمی را از داخل برنامه دوباره نصب کنید. |
+| **نصب خودکار سرور** | MasterDNS پورت اشغال‌شده و اجرای واقعی سرور را بررسی می‌کند، پورت را در فایروال باز می‌کند و تنظیمات تازه دارد؛ OpenFlux روی نودهای دارای ufw کار می‌کند و کپچای یاندکس را گزارش می‌دهد. |
+| **رفع اشکال‌ها** | AmneziaWG با `RandomTrailers = on` (#51)؛ سرورهای رایگان هنگام روشن بودن VPN؛ پیام «به‌روز شد» بدون اینترنت؛ «IP من» در دسکتاپ بدون 2ip. |
+| **AppImage لینوکس** | کنار `.deb`، AppImage برای x64 و arm64 — بدون نصب روی هر توزیعی اجرا می‌شود. |
+
+---
+
+## امکانات
+
+| | |
+|---|---|
+| **چند موتور** | Xray، sing-box، AmneziaWG، VK-TURN، MasterDNS — هسته بر اساس پروتکل به‌صورت خودکار یا دستی انتخاب می‌شود. |
+| **پروتکل‌ها** | VLESS · VMess · Trojan · Shadowsocks · Hysteria2 · WireGuard / AmneziaWG |
+| **ترنسپورت‌ها** | TCP · WS · gRPC · HTTPUpgrade · XHTTP · TLS · Reality · اثرانگشت‌های uTLS |
+| **MasterDNS (تونل DNS)** | تونل روی کوئری‌های DNS (MasterDnsVPN) — جایی کار می‌کند که همه‌ی ترافیک دیگر مسدود است اما DNS هنوز کار می‌کند. نصب یک‌ضربه‌ای سرور روی VPS از طریق SSH. |
+| **پروکسی تلگرام روی WARP** | سرویس سبک پس‌زمینه: یک تونل WARP + یک SOCKS5 محلی برای تلگرام، مستقل از اتصال اصلی. |
+| **olcRTC** | ترنسپورت [olcRTC](https://github.com/openlibrecommunity/olcrtc) — ترافیک از سرویس‌های واقعی تماس تصویری (Jazz، Telemost، WB Stream، Jitsi) عبور می‌کند؛ برای DPI شبیه یک تماس زنده است، نه پروکسی. |
+| **ایمپورت هوشمند** | لینک‌های vless/vmess/trojan/ss، base64، پنل‌های JSON، **کانفیگ‌های خام کامل Xray / sing-box** (همان‌طور که هست اعمال می‌شوند)، AmneziaWG `.conf`/QR، URI‌های olcRTC، پروفایل‌های Happ، ایمپورت انبوه فهرست لینک‌ها. |
+| **DNS و مسیریابی** | پروفایل‌های مسیریابی سازگار با Happ (مسدود/مستقیم/پروکسی بر اساس `geoip:`/`geosite:`/`asn:`/دامنه/CIDR)، قواعد سبک v2rayNG، کلید «مسدودسازی دامنه‌های روسیه»، DNS و fakedns سفارشی. |
+| **انتخاب خودکار سرور** | اتصال یک‌ضربه‌ای به سریع‌ترین گره در دسترس، با جابه‌جایی در صورت خطا. |
+| **پروکسی HTTP** | یک پروکسی HTTP محلی سازگار با Happ روی موتور فعال. |
+| **دور زدن DPI** | تکه‌تکه‌سازی TLS، مالتی‌پلکسینگ، مبهم‌سازی AmneziaWG، مسدودسازی QUIC جایی که نشت می‌کند. |
+| **بدون نشتی** | هم IPv4 و هم IPv6 را می‌گیرد — چیزی از کنار تونل خارج نمی‌شود. |
+| **تونل تفکیکی** | انتخاب می‌کنید کدام اپ‌ها از وی‌پی‌ان عبور کنند. |
+| **اشتراک‌ها** | به‌روزرسانی خودکار (قابل خاموش‌کردن برای هر اشتراک)، شمارنده‌ی سرورهای در دسترس، توضیح سرورها، ترافیک/باقی‌مانده، گروه‌ها با جمع‌کردن/سنجاق/مرتب‌سازی بر اساس پینگ، پوشه‌ها. |
+
+</div>
+
+---
+
+## دانلود
+
+آخرین APK امضاشده را از **[صفحه‌ی انتشارها](https://github.com/yanisplugg/olcvpn-client/releases/latest)** بگیرید.
+
+| نسخه | برای |
+|------|------|
+| **`arm64-v8a`** | گوشی‌های امروزی — اگر مطمئن نیستید این را بگیرید |
+| `armeabi-v7a` | دستگاه‌های قدیمی ۳۲ بیتی |
+| `x86_64` | شبیه‌سازها / تبلت‌های x86 |
+| `universal` | یک فایل برای همه (بزرگ‌ترین) |
+
+حداقل **Android 6.0** (API 23).
+
+---
+
+<div dir="rtl">
+
+## مجوزها و دلیل نیاز به آن‌ها
+
+YPtun فقط چیزی را درخواست می‌کند که یک قابلیت مشخص بدون آن کار نمی‌کند. دوربین، اعلان‌ها، استفاده‌ی بدون محدودیت از باتری و نصب به‌روزرسانی زمانی درخواست می‌شوند که از همان قابلیت استفاده می‌کنید، نه هنگام نصب.
+
+### اندروید
+
+| مجوز | برای چه |
+|---|---|
+| **VPN** (`BIND_VPN_SERVICE`) | درخواست سیستمی «اجازه‌ی اتصال VPN» در اولین اتصال. بدون آن اپ نمی‌تواند تونل را بالا بیاورد و ترافیک را از آن عبور دهد. |
+| **اینترنت و وضعیت شبکه** (`INTERNET`، `ACCESS_NETWORK_STATE`) | اتصال به سرورها، پینگ، دریافت اشتراک‌ها؛ اتصال دوباره هنگام جابه‌جایی بین Wi-Fi و داده‌ی همراه. |
+| **اجرا در پس‌زمینه** (`FOREGROUND_SERVICE`، `FOREGROUND_SERVICE_SPECIAL_USE`، `WAKE_LOCK`) | VPN و پروکسی تلگرام به‌صورت سرویس با اعلان اجرا می‌شوند تا سیستم هنگام خاموش‌بودن صفحه آن‌ها را متوقف نکند. |
+| **اعلان‌ها** (`POST_NOTIFICATIONS`، اندروید ۱۳+) | اعلان اتصال با سرعت و دکمه‌ی قطع — اندروید آن را برای سرویس پس‌زمینه الزامی می‌داند. |
+| **بدون محدودیت باتری** (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) | فقط با دکمه‌ای در تنظیمات: معافیت از Doze تا تونل شب‌ها قطع نشود. بدون لمس شما درخواست نمی‌شود. |
+| **دوربین** (`CAMERA`) | اسکنر QR برای ایمپورت سرورها. در اولین بازکردن اسکنر درخواست می‌شود؛ تصاویر روی گوشی پردازش می‌شوند و به هیچ‌جا ارسال نمی‌شوند. بدون دوربین می‌توانید QR را از فایل تصویر ایمپورت کنید. |
+| **فهرست اپ‌ها** (`QUERY_ALL_PACKAGES`) | تونل تفکیکی: نمایش همه‌ی اپ‌های نصب‌شده، از جمله اپ‌های سیستمی بدون آیکون، تا انتخاب کنید کدام از VPN عبور کنند. این فهرست از گوشی خارج نمی‌شود. |
+| **نصب اپ‌ها** (`REQUEST_INSTALL_PACKAGES`) | به‌روزرسانی از داخل اپ: APK دانلودشده به نصب‌کننده‌ی سیستم داده می‌شود که باز هم از شما تأیید می‌گیرد. |
+| **کارها پس از راه‌اندازی مجدد** (`RECEIVE_BOOT_COMPLETED`، `FOREGROUND_SERVICE_DATA_SYNC`) | کتابخانه‌ی WorkManager اضافه‌شان می‌کند تا یک کار دوره‌ای پس از ری‌استارت باقی بماند. فقط یک کار این‌چنینی هست — اعلام حضور روزانه برای اشتراک‌های دارای Happ `providerid` (پایین‌تر را ببینید). YPtun خودش اجرای خودکار ندارد. |
+| **انتقال داده** (`org.olcbox.app.permission.MIGRATION`) | مجوز اختصاصی اپ در سطح signature: تنظیمات را از نصب قدیمی `org.olcbox.app` به نصب جدید `org.yptun.app` منتقل می‌کند. فقط APK با همان امضا می‌تواند این داده‌ها را بخواند. |
+
+### ویندوز
+
+| دسترسی | برای چه |
+|---|---|
+| **مدیر سیستم** (UAC) | فقط برای حالت «تونل»: ساخت آداپتور شبکه (wintun) و افزودن مسیرها. اگر این حالت انتخاب شده باشد، یک بار هنگام اجرا پرسیده می‌شود. حالت «پروکسی» به دسترسی مدیر نیاز ندارد. |
+| **پروکسی سیستم** | در حالت «پروکسی» اپ پروکسی ویندوز را برای کاربر فعلی تنظیم می‌کند و هنگام قطع اتصال تنظیمات قبلی را برمی‌گرداند. اگر اپ از کار بیفتد، پروکسی باقی‌مانده در اجرای بعدی پاک می‌شود. |
+| **فهرست فرایندها** | تونل تفکیکی بر اساس فرایند — و شناسایی کلاینت VPN دیگری که در حال اجراست و مانع اتصال می‌شود. اپ پیشنهاد می‌کند آن را ببندد، اما بدون رضایت شما چیزی را متوقف نمی‌کند. |
+
+### اپ جز سرورهای شما به کجا وصل می‌شود
+
+- **GitHub** — بررسی به‌روزرسانی و، به‌طور پیش‌فرض، فهرست‌های مسیریابی (geoip/geosite، ASN).
+- **`check.happ-proxy.com`** — فقط اگر اشتراک Happ `providerid` داشته باشد: روزی یک بار، مانند خود Happ، اپ اعلام حضوری با همان داده‌های دستگاه که خود اشتراک دریافت می‌کند می‌فرستد (HWID، سیستم‌عامل، مدل، نسخه‌ی اپ). بدون `providerid` چنین درخواستی وجود ندارد.
+- **سرویس‌های روش اتصالی که انتخاب کرده‌اید** — VK (VK-TURN)، Cloudflare (تلگرام روی WARP)، سرویس‌های تماس (olcRTC)، Yandex Docs یا MAX (OpenFlux).
+
+</div>
+
+---
+
+## چطور کار می‌کند
+
+```
+┌──────────────┐  packets   ┌───────────────┐   SOCKS5   ┌────────────────────────────┐
+│     Apps     │ ─────────▶ │  Android TUN  │ ─────────▶ │      Engine (1 process)    │
+└──────────────┘            │  (IPv4+IPv6)  │            │  ┌──────────────────────┐  │
+                            └───────────────┘            │  │  Xray / sing-box     │  │
+                                                         │  │  AmneziaWG / VK-TURN │  │
+                                                         │  │  MasterDNS / olcRTC      │  │
+                                                         │  └──────────────────────┘  │
+                                                         └─────────────┬──────────────┘
+                                                                       ▼
+                                                                 open internet
+```
+
+<div dir="rtl">
+
+همه‌ی هسته‌های بومی در **یک** کتابخانه‌ی `gomobile` (یک Go runtime واحد) ساخته می‌شوند، بنابراین Xray، sing-box، AmneziaWG، VK-TURN، MasterDNS و olcRTC بدون تداخل در یک پراسس کنار هم زندگی می‌کنند. اپ یک `VpnService` بالا می‌آورد، بسته‌ها را به TUN می‌دهد و آن‌ها را از طریق یک SOCKS5 محلی در موتور انتخاب‌شده می‌پیچد.
+
+---
+
+## موتورها به زبان ساده
+
+- **Xray / sing-box** — هسته‌های پروکسی کلاسیک: VLESS+Reality، XHTTP، WS+TLS و … . هسته بر اساس ترنسپورت به‌صورت خودکار انتخاب می‌شود.
+- **AmneziaWG** — وایرگارد با مبهم‌سازی: دست‌دادن و بسته‌ها شبیه وایرگارد «معمولی» نیستند که اغلب بر اساس امضا قطع می‌شود.
+- **Hysteria2** — پروتکل سریع مبتنی بر QUIC با مبهم‌سازی Salamander و پرش پورت؛ روی خطوط ناپایدار سرعت را خوب نگه می‌دارد.
+- **VK-TURN** — یک وایرگارد محلی بالا می‌آورد و آن را از سرورهای TURN تماس‌های VK عبور می‌دهد؛ چند «تماس» برای پهنای باند به هم پیوند می‌خورند.
+- **MasterDNS** — تونل روی کوئری‌های DNS؛ جایی کار می‌کند که فقط DNS باز است.
+- **olcRTC** — استتار به‌صورت تماس تصویری: ترافیک از سرویس‌های واقعی کنفرانس عبور می‌کند و برای DPI شبیه یک تماس زنده است.
+- **پروکسی تلگرام روی WARP** — یک پروکسی پس‌زمینه‌ی مستقل برای تلگرام روی کلودفلر WARP.
+
+---
+
+## ساخت از منبع
+
+هر چیز لازم از پیش در مخزن هست (`cores`، `olcrtc`، `sing-box`، `awgproxy`، `hysteria2proxy`، `free-turn-proxy`، `masterdns`، `wdtt`، `amneziawg-go`). به این‌ها نیاز دارید:
+
+- **JDK 17** (همان نسخه‌ی همراه Android Studio کافی است)
+- **Android SDK** (مقدار `sdk.dir` را در `YPtun/local.properties` قرار دهید) + **NDK `28.2.13676358`**
+- **Go** + [`gomobile`](https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile) در `PATH`
+
+> `gomobile` به `javac` فراخوان می‌زند، پس مسیر `bin/` از JDK را در `PATH` قرار دهید — نه فقط `JAVA_HOME`.
+
+</div>
+
+```bash
+cd YPtun
+./gradlew :androidApp:assembleRelease \
+  -Polcbox.version=3.6.0 -Polcbox.versionCode=381
+```
+
+<div dir="rtl">
+
+APK‌ها در `YPtun/androidApp/build/outputs/apk/release/` ساخته می‌شوند.
+ساخت سریع‌تر فقط برای گوشی خودتان؟ `-Polcbox.android.abiFilters=arm64-v8a` را اضافه کنید.
+
+---
+
+## توسعه
+
+YPtun یک پروژه‌ی **Kotlin Multiplatform** است: همه‌ی منطق (ایمپورت، ساخت کانفیگ، موتورها، وضعیت UI) در `commonMain` و جزئیات پلتفرمی در `androidMain` است. همان کد روی دسکتاپ JVM هم اجرا می‌شود.
+
+- **رابط کاربری** — Jetpack Compose، یک طراحی روی همه‌ی پلتفرم‌ها.
+- **بومی‌سازی** — روسی، انگلیسی، فارسی و چینی ساده‌شده در یک فایل رشته‌ها.
+- **هسته‌های بومی** — Go، با تسک `buildCoresAndroidAar` در یک gomobile AAR ساخته می‌شوند.
+- **تست‌ها** — تست‌های واحد برای پارسرها/مبدل‌های مسیریابی (`./gradlew :sharedUI:jvmTest`).
+- **شاخه‌ها** — پایدار در `main`، توسعه‌ی فعال در `Beta`؛ انتشارها با `vX.Y.Z` تگ می‌شوند.
+
+باگ پیدا کردید یا ویژگی می‌خواهید؟ یک issue یا PR باز کنید — **[CONTRIBUTING.md](CONTRIBUTING.md)** را ببینید.
+
+---
+
+## ساختار پروژه
+
+</div>
+
+```
+YPtun/            اپ Kotlin Multiplatform — رابط Compose، VpnService اندروید، موتورها
+cores/            چسب Go: یک gomobile AAR از sing-box + olcRTC + Xray + AmneziaWG + VK-TURN + MasterDNS
+olcrtc/           olcRTC — ترنسپورت استتار تماس تصویری             (شخص ثالث، vendored)
+sing-box/         sing-box / libbox                                (vendored)
+awgproxy/         پوشش AmneziaWG → SOCKS5 محلی                     (ماژول Go)
+hysteria2proxy/   پوشش Hysteria2 (apernet) → SOCKS5 محلی           (ماژول Go)
+free-turn-proxy/  VK-TURN — تونل از تماس‌های VK                    (ماژول Go)
+masterdns/        MasterDNS — تونل روی DNS                              (کلاینت + سرور)
+wdtt/             WDTT — نوع دیگری از تونل                          (کلاینت + سرور)
+amneziawg-go/     پیاده‌سازی AmneziaWG                              (vendored)
+```
+
+<div dir="rtl">
+
+---
+
+## نقشه‌ی راه
+
+- [x] انتشار اندروید
+- [x] موتورهای AmneziaWG، VK-TURN و MasterDNS
+- [x] پروفایل‌های مسیریابی (سازگار با Happ) + ASN
+- [x] ساخت **ویندوز** (x64 و ARM64)
+- [x] ساخت **لینوکس** (`.deb`، x64 و ARM64)
+- [ ] ساخت **iOS** — *در مرحله‌ی بتا*
+
+---
+
+## مشارکت
+
+PR و issue پذیرفته می‌شوند. پیش از شروع ببینید:
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — نحوه‌ی ساخت، قالب‌بندی و ارسال تغییرات
+- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** — قواعد جامعه
+- **[SECURITY.md](SECURITY.md)** — نحوه‌ی گزارش آسیب‌پذیری
+
+---
+
+## سپاس‌گزاری
+
+بر شانه‌ی غول‌ها:
+[Xray-core](https://github.com/XTLS/Xray-core) ·
+[sing-box](https://github.com/SagerNet/sing-box) ·
+[olcRTC](https://github.com/openlibrecommunity/olcrtc) ·
+[AmneziaWG](https://github.com/amnezia-vpn/amneziawg-go) ·
+[OpenFlux](https://github.com/p1neappleXpress/OpenFlux) ·
+[qWDTT](https://github.com/SpaceNeuroX/proxy-turn-vk-android) ·
+[MasterDnsVPN](https://github.com/masterking32/MasterDnsVPN) ·
+[free-turn-proxy](https://github.com/samosvalishe/free-turn-proxy) ·
+[TrustTunnel](https://github.com/TrustTunnel/TrustTunnelClient) ·
+[hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) ·
+[tun2socks](https://github.com/xjasonlyu/tun2socks).
+
+## مجوز
+
+[GPL-3.0](LICENSE) — اپ تحت GNU GPL v3.0 منتشر می‌شود چون **sing-box** (آن هم GPL-3.0) را در خود دارد: کپی‌لفت بر کل محصول اعمال می‌شود. اجزای vendored مجوز خود را حفظ می‌کنند (`sing-box` — GPL-3.0، Xray — MPL-2.0، `amneziawg-go` — MIT، `olcrtc` — WTFPL، OpenFlux — GPL-3.0، qWDTT (`wdtt`) — GPL-3.0، MasterDnsVPN (`masterdns`) — MIT، `free-turn-proxy` — Happy Bunny License (شبیه MIT)، Trust Tunnel — Apache-2.0، `hev-socks5-tunnel` — MIT، `tun2socks` — MIT).
+
+</div>
+
+<div align="center">
+<br>
+
+<img src="docs/no-rkn.jpg" alt="نه به سانسور" width="150">
+
+<br><br>
+
+> *«ملتی که می‌ترسد مردمش حقیقت و دروغ را در بازار آزاد داوری کنند، ملتی است که از مردم خود می‌ترسد.»*
+>
+> — **جان اف. کندی**
+
+<br>
+
+<sub>برای اینترنت آزاد</sub>
+
+</div>

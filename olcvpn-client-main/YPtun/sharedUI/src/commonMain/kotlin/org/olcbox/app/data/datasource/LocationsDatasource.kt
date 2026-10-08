@@ -1,0 +1,2810 @@
+package org.olcbox.app.data.datasource
+
+import io.ktor.client.HttpClient
+import io.ktor.client.request.get
+import io.ktor.client.request.headers
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.HttpHeaders
+import io.ktor.http.encodeURLParameter
+import kotlin.concurrent.Volatile
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import org.olcbox.app.CurrentAppInfo
+import org.olcbox.app.data.importer.AmneziaWgParser
+import org.olcbox.app.data.importer.FreeturnUriParser
+import org.olcbox.app.data.importer.QwdttUriParser
+import org.olcbox.app.data.importer.ShareLinkParser
+import org.olcbox.app.data.importer.SubscriptionDecoder
+import org.olcbox.app.data.importer.UnifiedServersJsonParser
+import org.olcbox.app.data.identity.DeviceIdentityProvider
+import org.olcbox.app.data.identity.DeviceInfo
+import org.olcbox.app.data.identity.PersistentDeviceIdentityProvider
+import org.olcbox.app.data.model.AppBehaviorSettings
+import org.olcbox.app.data.model.SubscriptionUserAgentHolder
+import org.olcbox.app.data.model.EngineType
+import org.olcbox.app.data.model.FakeDnsSpec
+import org.olcbox.app.data.model.ProxyCore
+import org.olcbox.app.data.model.LocationBundleV4
+import org.olcbox.app.data.model.LocationConfig
+import org.olcbox.app.data.model.LocationEntry
+import org.olcbox.app.data.model.LocationMetadata
+import org.olcbox.app.data.model.LocationViewIndex
+import org.olcbox.app.data.model.ProxyProfile
+import org.olcbox.app.data.model.SubscriptionMetadata
+import org.olcbox.app.data.model.VkTurnConfig
+import org.olcbox.app.data.repository.LocationsRepository
+import org.olcbox.app.data.repository.SubscriptionFetchProxy
+import org.olcbox.app.data.share.YptunInboundCodec
+import org.olcbox.app.util.IsoTime
+
+interface LocationsDataSource {
+    suspend fun loadLocationBundle(): LocationBundleV4?
+    suspend fun saveLocationBundle(bundle: LocationBundleV4)
+
+    /**
+     * Loads the lightweight [LocationViewIndex] persisted alongside the bundle (names + metadata only,
+     * no heavy connection payloads), used to paint the location list INSTANTLY on a cold start before
+     * the full bundle decode finishes. Default `null` = no fast index on this platform (falls back to
+     * the full decode); only Android, where the cold-start lag is felt, persists and returns it.
+     */
+    suspend fun loadLocationViewIndex(): LocationViewIndex? = null
+    suspend fun loadLegacyLocations(): List<Pair<String, String>>
+    suspend fun loadLegacyActiveLocationId(): String?
+    suspend fun loadDeviceIdentity(): String? = null
+    suspend fun saveDeviceIdentity(value: String) = Unit
+
+    /**
+     * Persisted app-specific install id (the `x-app-id`/goiID header). Distinct from the HWID; a random
+     * per-install token generated once. Default no-op store; only Android needs real persistence.
+     */
+    suspend fun loadAppInstallId(): String? = null
+    suspend fun saveAppInstallId(value: String) = Unit
+
+    /**
+     * Cached Telegram-over-WARP AmneziaWG config (generated once from Cloudflare on first enable, then
+     * reused). Default no-op store; only Android needs real persistence.
+     */
+    suspend fun loadTelegramWarpConfig(): String? = null
+    suspend fun saveTelegramWarpConfig(value: String) = Unit
+
+    /**
+     * Persisted state for the Happ-style provider-usage report — an opaque JSON string mapping each
+     * `providerid` to the epoch-day it was last reported, so the daily report fires at most once per
+     * calendar day per id across restarts (and is shared with the background worker). Default no-op
+     * (no persistence) on platforms without a store; only Android needs real persistence here.
+     */
+    suspend fun loadProviderReportState(): String? = null
+    suspend fun saveProviderReportState(value: String) = Unit
+
+    /**
+     * A platform-stable device id (e.g. Android ANDROID_ID) used to seed the HWID so it
+     * survives reinstalls / data-clears. Null when the platform offers no stable id.
+     */
+    suspend fun platformStableId(): String? = null
+
+    /**
+     * A cheap change token for the persisted bundle (e.g. file mtime + size), used by the repository
+     * to cache the decoded bundle and skip the re-read/decode when nothing changed. The token MUST
+     * change whenever the bundle is rewritten by ANY repository instance (the VPN service holds its
+     * own instance), so a stale cache can never be served. Default `null` = no token available, which
+     * disables the cache (always reload) — only Android, where the lag matters, overrides this.
+     */
+    suspend fun bundleVersionToken(): Long? = null
+}
+
+internal expect fun createProxyHttpClient(
+    subscriptionProxy: SubscriptionFetchProxy? = null,
+    connectTimeoutMs: Long = 3_000,
+    requestTimeoutMs: Long = 8_000,
+    socketTimeoutMs: Long = 8_000
+): HttpClient
+
+internal expect suspend fun <T> withProxyAuthentication(
+    subscriptionProxy: SubscriptionFetchProxy?,
+    block: suspend () -> T
+): T
+
+class LocationsRepositoryImpl(
+    private val dataSource: LocationsDataSource,
+    private val httpClient: HttpClient = createProxyHttpClient(),
+    private val deviceIdentityProvider: DeviceIdentityProvider = PersistentDeviceIdentityProvider(dataSource),
+    private val nowEpochMs: () -> Long = { kotlin.time.Clock.System.now().toEpochMilliseconds() }
+) : LocationsRepository {
+    private data class ImportSource(
+        val content: String,
+        val subscriptionUrl: String? = null,
+        val updateIntervalHours: Int? = null,
+        val requestMode: SubscriptionRequestMode = SubscriptionRequestMode.Identity,
+        val profileTitle: String? = null,
+        val userInfo: String? = null,
+        /** Best-effort JSON from the Remnawave `<url>/info` endpoint (carries user.expiresAt etc.). */
+        val infoJson: String? = null,
+        /** Best-effort rich Xray JSON (Happ-UA fetch) used only to extract the FakeDNS spec. */
+        val fakednsJson: String? = null,
+        /** Remnawave `support-url` header (panel support link). */
+        val supportUrl: String? = null,
+        /** Remnawave `profile-web-page-url` header (subscription management page). */
+        val webPageUrl: String? = null,
+        /** Remnawave `announce` header (panel announcement; may be base64). */
+        val announce: String? = null,
+        /** Happ/Remnawave `providerid` header (provider tracking id). */
+        val providerId: String? = null,
+        /** Remnawave `profile-id` header (subscription id shown to the user). */
+        val subscriptionId: String? = null
+    )
+
+    private data class DownloadedSubscription(
+        val content: String,
+        val updateIntervalHours: Int?,
+        val profileTitle: String? = null,
+        val userInfo: String? = null,
+        val infoJson: String? = null,
+        val fakednsJson: String? = null,
+        val supportUrl: String? = null,
+        val webPageUrl: String? = null,
+        val announce: String? = null,
+        val providerId: String? = null,
+        val subscriptionId: String? = null
+    )
+
+    private data class ParsedImport(
+        val bundle: LocationBundleV4,
+        val mode: ImportMode
+    )
+
+    private data class ResolvedImport(
+        val source: ImportSource,
+        val parsed: ParsedImport
+    )
+
+    private data class ParsedOlcRtcUri(
+        val location: LocationConfig,
+        val mimo: String? = null
+    )
+
+    private enum class ImportMode {
+        Additive,
+        Restore
+    }
+
+    private enum class SubscriptionRequestMode {
+        Identity,
+        Compatibility
+    }
+
+    private val mutationMutex = Mutex()
+    // In-memory cache of the decoded bundle. Every getBundle() otherwise re-reads the file and
+    // JSON-decodes + normalizes the whole bundle; app startup alone fires many reads (active config,
+    // the full location list, subscription backfill, expiry-notify, provider-report), so with hundreds
+    // of configs that repeated decode is what makes the list appear with a lag. The bundle is read ONLY
+    // via getBundleUnlocked and written ONLY via saveBundleUnlocked, both always under [mutationMutex];
+    // getBundle's lock-free fast path reads it too, so bundle and token live in ONE @Volatile pair —
+    // never a new bundle with an old token. The cache is keyed on [LocationsDataSource.bundleVersionToken]
+    // so a write from ANY instance (the VPN service keeps its own repository) invalidates it — the
+    // service can never connect with a stale config. A null token disables the cache (always reload).
+    @Volatile
+    private var cached: Pair<LocationBundleV4, Long?>? = null
+    private val _changes = MutableStateFlow(0L)
+    override val changes: StateFlow<Long> = _changes.asStateFlow()
+
+    private val json = Json {
+        ignoreUnknownKeys = true
+        coerceInputValues = true
+        encodeDefaults = true
+        explicitNulls = false
+        prettyPrint = true
+    }
+
+    override suspend fun getBundle(): LocationBundleV4 {
+        // Fast path without the mutex: a cold start must not wait behind a long mutation
+        // (a subscription refresh) just to paint an unchanged bundle.
+        cachedFor(dataSource.bundleVersionToken())?.let { return it }
+        return mutationMutex.withLock {
+            getBundleUnlocked()
+        }
+    }
+
+    override suspend fun getViewIndex(): LocationViewIndex? {
+        // Lock-free on purpose: this reads a SEPARATE, tiny file (no touch to the cached bundle) and is
+        // only ever used to paint the list fast on launch — it must not wait behind a long mutation.
+        return runCatching { dataSource.loadLocationViewIndex() }.getOrNull()
+    }
+
+    private suspend fun getBundleUnlocked(): LocationBundleV4 {
+        val token = dataSource.bundleVersionToken()
+        cachedFor(token)?.let { return it }
+
+        // Normalization happens HERE (the repository is the single read funnel), so the platform
+        // datasources do raw IO + decode only and we never pay a double normalize+filter+dedup pass over
+        // the whole bundle. normalized() is idempotent and every write is already normalized, so this is
+        // behaviour-safe; it also keeps the in-memory token cache keyed to the canonical form.
+        val stored = dataSource.loadLocationBundle()?.normalized()
+        if (stored != null && stored.locations.isNotEmpty()) {
+            cacheBundle(stored, token)
+            return stored
+        }
+
+        val legacy = migrateLegacyBundle()
+        if (legacy.locations.isNotEmpty()) {
+            dataSource.saveLocationBundle(legacy)
+            // The write changed the file; re-read the token so the cache matches the on-disk state.
+            cacheBundle(legacy, dataSource.bundleVersionToken())
+        } else {
+            cacheBundle(legacy, token)
+        }
+        return legacy
+    }
+
+    /** Stores [bundle] as the in-memory cache under its [token] (null token = effectively uncached). */
+    private fun cacheBundle(bundle: LocationBundleV4, token: Long?) {
+        cached = bundle to token
+    }
+
+    private fun cachedFor(token: Long?): LocationBundleV4? =
+        cached?.takeIf { token != null && it.second == token }?.first
+
+    override suspend fun saveBundle(bundle: LocationBundleV4) {
+        mutationMutex.withLock {
+            saveBundleUnlocked(bundle)
+        }
+    }
+
+    private suspend fun saveBundleUnlocked(bundle: LocationBundleV4) {
+        val normalized = bundle.normalized()
+        dataSource.saveLocationBundle(normalized)
+        // Cache the just-written bundle under the post-write token so the next read serves it directly.
+        cacheBundle(normalized, dataSource.bundleVersionToken())
+        _changes.value = _changes.value + 1
+    }
+
+    override suspend fun exportBundle(): String {
+        return json.encodeToString(LocationBundleV4.serializer(), getBundle())
+    }
+
+    override suspend fun importText(text: String, subscriptionProxy: SubscriptionFetchProxy?): Boolean {
+        val resolved = resolveParsedImport(
+            text = text,
+            subscriptionProxy = subscriptionProxy
+        ) ?: return false
+
+        // The data was just fetched, so stamp "now" as the last-refresh time on every imported
+        // subscription entry — otherwise a freshly added subscription shows no "обновлена …" date
+        // until its first scheduled/manual refresh.
+        val now = nowEpochMs()
+        val importedInterval = resolved.source.updateIntervalHours
+        val imported = resolved.parsed.bundle.normalized().let { bundle ->
+            bundle.copy(
+                locations = bundle.locations.map { entry ->
+                    val isSubscription = entry.metadata?.subscription != null ||
+                        !entry.subscriptionUrl.isNullOrBlank()
+                    if (!isSubscription) {
+                        entry
+                    } else {
+                        val interval = entry.metadata?.subscription?.updateIntervalHours
+                            ?: importedInterval
+                            ?: SubscriptionMetadata.DEFAULT_UPDATE_INTERVAL_HOURS
+                        entry.copy(
+                            metadata = entry.metadata.withSubscriptionRefreshState(
+                                updateIntervalHours = interval,
+                                lastRefreshAtEpochMs = now,
+                                lastAttemptAtEpochMs = now
+                            )
+                        ).normalized()
+                    }
+                }
+            )
+        }
+
+        mutationMutex.withLock {
+            val current = getBundleUnlocked()
+            // Re-importing the SAME subscription URL must behave like a refresh: drop the old entries
+            // from that URL first so freshly-parsed fields (typed profile, transports, FakeDNS spec)
+            // REPLACE the stale ones, instead of being dropped as duplicates by the additive merge.
+            // Without this, an old import (e.g. before FakeDNS extraction existed) sticks around and
+            // re-adding the subscription never picks up the new fields.
+            val subUrl = resolved.source.subscriptionUrl?.trim()?.takeIf { it.isNotBlank() }
+            val basis = if (subUrl != null) {
+                current.copy(
+                    locations = current.locations.filterNot { it.subscriptionUrl?.trim() == subUrl }
+                )
+            } else {
+                current
+            }
+            val merged = mergeImportedBundle(
+                current = basis,
+                imported = imported,
+                replaceMatchingStorageIds = resolved.parsed.mode == ImportMode.Restore
+            )
+            saveBundleUnlocked(merged)
+        }
+        return true
+    }
+
+    override suspend fun refreshSubscriptions(subscriptionProxy: SubscriptionFetchProxy?): Int {
+        return mutationMutex.withLock {
+            refreshSubscriptionsUnlocked(
+                onlyUrls = null,
+                subscriptionProxy = subscriptionProxy
+            )
+        }
+    }
+
+    override suspend fun refreshSubscription(
+        subscriptionUrl: String,
+        subscriptionProxy: SubscriptionFetchProxy?
+    ): Int {
+        val normalizedUrl = subscriptionUrl.trim()
+        if (normalizedUrl.isBlank()) return 0
+        return mutationMutex.withLock {
+            refreshSubscriptionsUnlocked(
+                onlyUrls = setOf(normalizedUrl),
+                subscriptionProxy = subscriptionProxy
+            )
+        }
+    }
+
+    private suspend fun refreshSubscriptionsUnlocked(
+        onlyUrls: Set<String>?,
+        subscriptionProxy: SubscriptionFetchProxy?
+    ): Int {
+        val bundle = getBundleUnlocked()
+        if (bundle.locations.isEmpty()) return 0
+
+        val groupedByUrl = bundle.locations
+            .mapNotNull { entry -> entry.subscriptionUrl?.trim()?.takeIf { it.isNotBlank() }?.let { it to entry } }
+            .groupBy({ it.first }, { it.second })
+            .filterKeys { url -> onlyUrls == null || url in onlyUrls }
+        if (groupedByUrl.isEmpty()) return 0
+
+        val targetUrls = groupedByUrl.keys
+        val refreshedLocations = bundle.locations
+            .filter { entry ->
+                val url = entry.subscriptionUrl?.trim()?.takeIf { it.isNotBlank() }
+                url == null || url !in targetUrls
+            }
+            .toMutableList()
+        val usedStorageIds = refreshedLocations.mapTo(mutableSetOf()) { it.storageId }
+        val activeBefore = bundle.activeLocationId
+        var activeAfter = activeBefore
+        var successfulRefreshes = 0
+        // True when a failed URL had its lastAttempt time bumped: persist that even with 0 successes so
+        // the due-check defers the next retry by the interval (instead of retrying every poll).
+        var attemptStateChanged = false
+
+        fun preservePreviousEntries(entries: List<LocationEntry>, attemptTimestamp: Long? = null) {
+            entries.forEach { entry ->
+                if (usedStorageIds.add(entry.storageId)) {
+                    refreshedLocations += if (attemptTimestamp == null) {
+                        entry
+                    } else {
+                        entry.copy(
+                            metadata = entry.metadata.withSubscriptionAttemptState(attemptTimestamp)
+                        ).normalized()
+                    }
+                }
+            }
+        }
+
+        groupedByUrl.forEach { (url, previousEntries) ->
+            val attemptTimestamp = nowEpochMs()
+            val previousInterval = previousEntries.subscriptionUpdateIntervalHours()
+            val previousAutoUpdate = previousEntries.subscriptionAutoUpdateEnabled()
+            val resolved = resolveParsedImport(
+                text = url,
+                fallbackSubscriptionInterval = previousInterval,
+                subscriptionProxy = subscriptionProxy
+            ) ?: run {
+                // Fetch/parse failed — keep the old links, just stamp the attempt so we retry later.
+                preservePreviousEntries(previousEntries, attemptTimestamp)
+                attemptStateChanged = true
+                return@forEach
+            }
+            val source = resolved.source
+            val updateInterval = source.updateIntervalHours
+                ?: previousInterval
+                ?: SubscriptionMetadata.DEFAULT_UPDATE_INTERVAL_HOURS
+            val refreshed = resolved.parsed.bundle.locations
+            if (refreshed.isEmpty()) {
+                preservePreviousEntries(previousEntries, attemptTimestamp)
+                attemptStateChanged = true
+                return@forEach
+            }
+
+            // Each refreshed server takes over the id (selection, pings) of the SAME server from before:
+            // same endpoint + same name first, then same endpoint alone (renamed upstream). Exact matches
+            // are resolved for the whole list before any fallback, so a fallback can't steal the id of a
+            // server that still exists further down.
+            val taken = mutableSetOf<String>()
+            fun claim(pool: List<LocationEntry>?): LocationEntry? =
+                pool?.firstOrNull { it.storageId !in taken }?.also { taken += it.storageId }
+            val byNamedSignature = previousEntries.groupBy { namedSubscriptionSignature(it.location) }
+            val bySignature = previousEntries.groupBy { subscriptionSignature(it.location) }
+            val exactReuse = refreshed.map { claim(byNamedSignature[namedSubscriptionSignature(it.location)]) }
+            val reusedEntries = refreshed.mapIndexed { index, entry ->
+                exactReuse[index] ?: claim(bySignature[subscriptionSignature(entry.location)])
+            }
+            // Reserve every reused id BEFORE generating new ones: a new server's id could otherwise
+            // equal a reused one, and the bundle's distinctBy(storageId) silently drops that server.
+            usedStorageIds += taken
+
+            // Was the previously-selected server one of THIS subscription's entries? If so we must
+            // decide its fate after the refresh: keep it if it still exists (reused by signature),
+            // otherwise fall back to this subscription's first server.
+            val activeInThisGroup = activeBefore != null && previousEntries.any { it.storageId == activeBefore }
+            var activeReusedHere = false
+
+            val reassigned = refreshed.mapIndexed { index, entry ->
+                val reusedEntry = reusedEntries[index]
+                val storageId = reusedEntry?.storageId ?: uniqueStorageId(
+                    base = "imported_${entry.location.storageSlug().ifBlank { "location_${index + 1}" }}",
+                    used = usedStorageIds
+                )
+                // The selected server survived the refresh (same signature → same storageId reused):
+                // keep it selected. Guard against null==null matching when nothing was selected.
+                if (activeBefore != null && reusedEntry?.storageId == activeBefore) {
+                    activeAfter = storageId
+                    activeReusedHere = true
+                }
+                entry.copy(
+                    storageId = storageId,
+                    subscriptionUrl = url,
+                    metadata = entry.metadata.withSubscriptionRefreshState(
+                        updateIntervalHours = updateInterval,
+                        lastRefreshAtEpochMs = attemptTimestamp,
+                        lastAttemptAtEpochMs = attemptTimestamp,
+                        autoUpdateEnabled = previousAutoUpdate
+                    )
+                ).normalized()
+            }
+
+            // Only reset the selection when the selected server actually vanished from this
+            // subscription (removed upstream / signature changed). If it was reused, leave it alone —
+            // otherwise every on-launch refresh would snap the user back to the first server.
+            if (activeInThisGroup && !activeReusedHere) {
+                activeAfter = reassigned.firstOrNull()?.storageId
+            }
+            refreshedLocations += reassigned
+            successfulRefreshes += 1
+        }
+
+        if (successfulRefreshes == 0 && !attemptStateChanged) return 0
+
+        saveBundleUnlocked(
+            bundle.copy(
+                activeLocationId = activeAfter,
+                locations = refreshedLocations
+            )
+        )
+        return successfulRefreshes
+    }
+
+    override suspend fun refreshDueSubscriptions(
+        subscriptionProxy: SubscriptionFetchProxy?,
+        retryFailed: Boolean
+    ): Int {
+        return mutationMutex.withLock {
+            val bundle = getBundleUnlocked()
+            val now = nowEpochMs()
+            val dueUrls = bundle.locations
+                .mapNotNull { entry ->
+                    val url = entry.subscriptionUrl?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    val metadata = entry.metadata?.subscription
+                    // Respect the per-subscription auto-update switch — skip when the user turned it off.
+                    if (metadata?.autoUpdateEnabled == false) return@mapNotNull null
+                    val interval = metadata?.updateIntervalHours
+                        ?: SubscriptionMetadata.DEFAULT_UPDATE_INTERVAL_HOURS
+                    // [retryFailed] (once per app launch): key the schedule off the last SUCCESSFUL
+                    // refresh only, so an overdue subscription that FAILED last time is retried again
+                    // (a failed attempt no longer pushes the next try out by a full interval).
+                    // Otherwise (periodic poll): key off the last ATTEMPT (success OR failure) so we
+                    // don't hammer an unreachable panel on every poll.
+                    val lastTouchAt = if (retryFailed) {
+                        metadata?.lastRefreshAtEpochMs ?: 0L
+                    } else {
+                        maxOf(
+                            metadata?.lastRefreshAtEpochMs ?: 0L,
+                            metadata?.lastAttemptAtEpochMs ?: 0L
+                        )
+                    }
+                    val intervalMs = interval.toLong() * 60L * 60L * 1_000L
+                    url.takeIf { lastTouchAt <= 0L || now - lastTouchAt >= intervalMs }
+                }
+                .toSet()
+
+            if (dueUrls.isEmpty()) {
+                0
+            } else {
+                refreshSubscriptionsUnlocked(
+                    onlyUrls = dueUrls,
+                    subscriptionProxy = subscriptionProxy
+                )
+            }
+        }
+    }
+
+    override suspend fun refreshSubscriptionsMissingExpiry(subscriptionProxy: SubscriptionFetchProxy?): Int {
+        return mutationMutex.withLock {
+            val bundle = getBundleUnlocked()
+            // Group by URL; a subscription needs backfill only if NONE of its entries has a stored
+            // expiry yet (refreshed entries all share the same merged metadata).
+            val urlsMissingExpiry = bundle.locations
+                .mapNotNull { entry ->
+                    val url = entry.subscriptionUrl?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    url to (entry.metadata?.subscription?.expiresAtEpochMs != null)
+                }
+                .groupBy({ it.first }, { it.second })
+                .filterValues { hasExpiryFlags -> hasExpiryFlags.none { it } }
+                .keys
+
+            if (urlsMissingExpiry.isEmpty()) {
+                0
+            } else {
+                refreshSubscriptionsUnlocked(
+                    onlyUrls = urlsMissingExpiry,
+                    subscriptionProxy = subscriptionProxy
+                )
+            }
+        }
+    }
+
+    override suspend fun reportProviderUsage() {
+        val ids = runCatching {
+            getBundle().locations
+                .mapNotNull { it.metadata?.subscription?.providerId?.trim()?.takeIf { id -> id.isNotBlank() } }
+                .distinct()
+        }.getOrDefault(emptyList())
+        if (ids.isEmpty()) return
+
+        val today = nowEpochMs() / 86_400_000L
+        // Persisted providerId → last-reported epoch-day, so we fire at most once per calendar day per
+        // id across restarts and shared with the background worker.
+        val state = loadProviderReportDays().toMutableMap()
+        // Identity + device descriptors, exactly like the subscription fetch sends to the panel.
+        val hwid = runCatching { deviceIdentityProvider.hwid() }.getOrNull().orEmpty()
+        val appId = runCatching { deviceIdentityProvider.appId() }.getOrNull().orEmpty()
+        val appVersion = CurrentAppInfo.value.version
+
+        var changed = false
+        ids.forEach { id ->
+            if (state[id] == today) return@forEach // already reported today
+            val ok = runCatching {
+                val response = httpClient.get(PROVIDER_CHECK_URL + id.encodeURLParameter()) {
+                    headers {
+                        append(HttpHeaders.UserAgent, subscriptionUserAgent())
+                        if (hwid.isNotBlank()) append("x-hwid", hwid)
+                        if (appId.isNotBlank()) append(HEADER_APP_ID, appId)
+                        append("x-device-os", DeviceInfo.os)
+                        append("x-ver-os", DeviceInfo.osVersion)
+                        append("x-device-model", DeviceInfo.model)
+                        append("x-app-version", appVersion)
+                    }
+                }
+                response.status.value in 200..299
+            }.getOrDefault(false)
+            if (ok) {
+                state[id] = today
+                changed = true
+            }
+        }
+        // Drop entries for provider ids that no longer exist so the state can't grow unbounded.
+        val pruned = state.filterKeys { it in ids }
+        if (changed || pruned.size != state.size) saveProviderReportDays(pruned)
+    }
+
+    /** Reads the persisted providerId → epoch-day report map (tolerates missing/corrupt state). */
+    private suspend fun loadProviderReportDays(): Map<String, Long> {
+        val raw = runCatching { dataSource.loadProviderReportState() }.getOrNull() ?: return emptyMap()
+        return runCatching {
+            json.parseToJsonElement(raw).jsonObject.mapNotNull { (k, v) ->
+                v.jsonPrimitive.contentOrNull?.toLongOrNull()?.let { k to it }
+            }.toMap()
+        }.getOrDefault(emptyMap())
+    }
+
+    /** Persists the providerId → epoch-day report map. */
+    private suspend fun saveProviderReportDays(map: Map<String, Long>) {
+        runCatching {
+            val obj = JsonObject(map.mapValues { JsonPrimitive(it.value) })
+            dataSource.saveProviderReportState(json.encodeToString(JsonObject.serializer(), obj))
+        }
+    }
+
+    override suspend fun setSubscriptionUpdateInterval(subscriptionUrl: String, hours: Int) {
+        val normalizedUrl = subscriptionUrl.trim()
+        if (normalizedUrl.isBlank()) return
+
+        mutationMutex.withLock {
+            val interval = hours.coerceIn(
+                SubscriptionMetadata.MIN_UPDATE_INTERVAL_HOURS,
+                SubscriptionMetadata.MAX_UPDATE_INTERVAL_HOURS
+            )
+            val bundle = getBundleUnlocked()
+            val updated = bundle.locations.map { entry ->
+                if (entry.subscriptionUrl?.trim() != normalizedUrl) {
+                    entry
+                } else {
+                    entry.copy(
+                        metadata = entry.metadata.withSubscriptionInterval(interval)
+                    ).normalized()
+                }
+            }
+
+            saveBundleUnlocked(bundle.copy(locations = updated))
+        }
+    }
+
+    override suspend fun setSubscriptionAutoUpdate(subscriptionUrl: String, enabled: Boolean) {
+        val normalizedUrl = subscriptionUrl.trim()
+        if (normalizedUrl.isBlank()) return
+
+        mutationMutex.withLock {
+            val bundle = getBundleUnlocked()
+            val updated = bundle.locations.map { entry ->
+                if (entry.subscriptionUrl?.trim() != normalizedUrl) {
+                    entry
+                } else {
+                    entry.copy(
+                        metadata = entry.metadata.withSubscriptionAutoUpdate(enabled)
+                    ).normalized()
+                }
+            }
+
+            saveBundleUnlocked(bundle.copy(locations = updated))
+        }
+    }
+
+    override suspend fun saveLocation(storageId: String, location: LocationConfig) {
+        mutationMutex.withLock {
+            val normalizedId = storageId.ifBlank { location.storageSlug() }
+            val bundle = getBundleUnlocked()
+            val current = bundle.locations.firstOrNull { it.storageId == normalizedId }
+            val entry = LocationEntry.from(
+                storageId = normalizedId,
+                location = location,
+                subscriptionUrl = current?.subscriptionUrl,
+                metadata = current?.metadata
+            )
+            // Replace in place to preserve list order; append only when it's a new entry.
+            // (Editing an existing location — e.g. switching its core — must not reorder it.)
+            val locations = if (bundle.locations.any { it.storageId == entry.storageId }) {
+                bundle.locations.map { if (it.storageId == entry.storageId) entry else it }
+            } else {
+                bundle.locations + entry
+            }
+
+            saveBundleUnlocked(
+                bundle.copy(
+                    activeLocationId = entry.storageId,
+                    locations = locations
+                )
+            )
+        }
+    }
+
+    override suspend fun loadLocation(storageId: String): LocationConfig? {
+        return mutationMutex.withLock {
+            getBundleUnlocked().locations.firstOrNull { it.storageId == storageId }?.location
+        }
+    }
+
+    override suspend fun deleteLocation(storageId: String) {
+        mutationMutex.withLock {
+            val bundle = getBundleUnlocked()
+            saveBundleUnlocked(
+                bundle.copy(
+                    activeLocationId = bundle.activeLocationId?.takeUnless { it == storageId },
+                    locations = bundle.locations.filterNot { it.storageId == storageId }
+                )
+            )
+        }
+    }
+
+    override suspend fun deleteLocations(storageIds: Collection<String>) {
+        if (storageIds.isEmpty()) return
+        val ids = storageIds.toHashSet()
+        mutationMutex.withLock {
+            val bundle = getBundleUnlocked()
+            saveBundleUnlocked(
+                bundle.copy(
+                    activeLocationId = bundle.activeLocationId?.takeUnless { it in ids },
+                    locations = bundle.locations.filterNot { it.storageId in ids }
+                )
+            )
+        }
+    }
+
+    override suspend fun getAllLocations(): List<LocationEntry> {
+        return mutationMutex.withLock {
+            getBundleUnlocked().locations
+        }
+    }
+
+    override suspend fun getActiveLocationId(): String? {
+        return mutationMutex.withLock {
+            getBundleUnlocked().activeLocationId
+        }
+    }
+
+    override suspend fun setActiveLocationId(storageId: String?) {
+        mutationMutex.withLock {
+            val bundle = getBundleUnlocked()
+            val nextActive = storageId?.takeIf { id -> bundle.locations.any { it.storageId == id } }
+            saveBundleUnlocked(bundle.copy(activeLocationId = nextActive))
+        }
+    }
+
+    override suspend fun getActiveLocation(): LocationEntry? {
+        return mutationMutex.withLock {
+            val bundle = getBundleUnlocked()
+            bundle.locations.firstOrNull { it.storageId == bundle.activeLocationId }
+        }
+    }
+
+    override suspend fun getDeviceIdentity(): String {
+        return deviceIdentityProvider.hwid()
+    }
+
+    private suspend fun resolveParsedImport(
+        text: String,
+        fallbackSubscriptionInterval: Int? = null,
+        subscriptionProxy: SubscriptionFetchProxy? = null
+    ): ResolvedImport? {
+        val input = text.normalizedImportText()
+        if (input.isBlank()) return null
+
+        var source = resolveImportSource(
+            text = input,
+            requestMode = SubscriptionRequestMode.Identity,
+            subscriptionProxy = subscriptionProxy
+        ) ?: run {
+            if (input.isHttpUrl()) {
+                resolveImportSource(
+                    text = input,
+                    requestMode = SubscriptionRequestMode.Compatibility,
+                    subscriptionProxy = subscriptionProxy
+                )
+            } else {
+                null
+            }
+        } ?: return null
+
+        var parsed = parseImportSource(source, fallbackSubscriptionInterval)
+            .takeUnless { source.isUnsupportedClientStub() }
+        if (parsed == null && input.isHttpUrl() && source.requestMode != SubscriptionRequestMode.Compatibility) {
+            val fallbackSource = resolveImportSource(
+                text = input,
+                requestMode = SubscriptionRequestMode.Compatibility,
+                subscriptionProxy = subscriptionProxy
+            )
+            if (fallbackSource != null) {
+                source = fallbackSource
+                parsed = parseImportSource(fallbackSource, fallbackSubscriptionInterval)
+                    .takeUnless { fallbackSource.isUnsupportedClientStub() }
+            }
+        }
+
+        // Panels answer an unknown UA ("YPtun/x") with a stub / 4xx ("client not supported"), so as the last
+        // resort re-fetch pretending to be a full Happ client (Happ UA + HWID/device headers).
+        if (parsed == null && input.isHttpUrl() && subscriptionUserAgent() != AppBehaviorSettings.HAPP_USER_AGENT) {
+            val happSource = resolveImportSource(
+                text = input,
+                requestMode = SubscriptionRequestMode.Identity,
+                subscriptionProxy = subscriptionProxy,
+                forceHapp = true
+            )
+            if (happSource != null) {
+                parseImportSource(happSource, fallbackSubscriptionInterval)?.takeUnless { happSource.isUnsupportedClientStub() }?.let { source = happSource; parsed = it }
+            }
+        }
+
+        return parsed?.let { ResolvedImport(source, it) }
+    }
+
+    /** The panel's "this subscription is not supported for this client" stub (arrives as a normal 200 body). */
+    private fun ImportSource.isUnsupportedClientStub(): Boolean {
+        val probe = listOfNotNull(content.take(4096), SubscriptionDecoder.decodeBase64Chunk(content.take(4096).trim()), profileTitle, announce)
+        return probe.any {
+            it.contains("не поддерживается для этого клиента", ignoreCase = true) ||
+                it.contains("not supported for this client", ignoreCase = true)
+        }
+    }
+
+    private fun parseImportSource(
+        source: ImportSource,
+        fallbackSubscriptionInterval: Int? = null
+    ): ParsedImport? {
+        val initialSubscriptionInterval = source.updateIntervalHours
+            ?: fallbackSubscriptionInterval
+            ?: source.subscriptionUrl?.let { SubscriptionMetadata.DEFAULT_UPDATE_INTERVAL_HOURS }
+
+        val parsed = parseImport(
+            source.content.normalizedImportText(),
+            source.subscriptionUrl,
+            initialSubscriptionInterval,
+            mergeSubscriptionMetadata(
+                // The panel JSON body (Remnawave `user{}`) carries the expiry + human traffic counters;
+                // the response headers carry the profile title (name) and may also carry traffic/expiry.
+                primary = subscriptionMetadataFromBody(source.infoJson ?: source.content),
+                secondary = subscriptionMetadataFromHeaders(
+                    profileTitle = source.profileTitle,
+                    userInfo = source.userInfo,
+                    supportUrl = source.supportUrl,
+                    webPageUrl = source.webPageUrl,
+                    announce = source.announce,
+                    providerId = source.providerId,
+                    subscriptionId = source.subscriptionId
+                )
+            // Persist the auto-refresh interval (profile-update-interval header) onto the metadata at
+            // import time too, so it's shown and used even before the first scheduled refresh.
+            ).withSubscriptionInterval(initialSubscriptionInterval)
+        ) ?: return null
+
+        // Enrich from the Happ-UA rich body (the only variant that carries BOTH FakeDNS and the
+        // per-server `meta.serverDescription`). The main fetch keeps the user's UA (default YPtun →
+        // plain links with neither), so recover both here and attach them. FakeDNS pool + dns.hosts are
+        // identical across all servers, so one spec is attached to every location that lacks one;
+        // descriptions are matched per server. xhttp/raw-Xray locations run verbatim on Xray and are
+        // left untouched for FakeDNS.
+        val richBody = source.fakednsJson
+        val fakeDnsSpec = richBody?.let { fakeDnsSpecFromSubscriptionBody(it) }
+        val descByServer = richBody?.let { serverDescriptionsFromSubscriptionBody(it) }.orEmpty()
+        // Verbatim configs from the Happ-UA body, swapped in for the link-parsed entries: xhttp/splithttp
+        // (a default-UA vless:// link can't carry the domain-fronting `extra` block) and ANY config that
+        // brings its own routing/DNS — a link carries none of it, and the panel's routing (RU direct,
+        // torrents blocked, …) must apply exactly as in Happ. See [verbatimXhttpConfigs].
+        val verbatimXhttp = richBody?.let { verbatimXhttpConfigs(it) }.orEmpty()
+        if (fakeDnsSpec == null && descByServer.isEmpty() && verbatimXhttp.isEmpty()) return parsed
+        val enriched = parsed.bundle.copy(
+            locations = parsed.bundle.locations.map { entry ->
+                var e = entry
+                // Description: fill only when the location has none yet (a Happ-UA main fetch already set
+                // it during parse). Matched by the proxy's server:port against the rich body.
+                if (e.description.isBlank() && descByServer.isNotEmpty()) {
+                    val key = e.proxy?.let { "${it.server}:${it.serverPort}" }
+                    if (key != null) descByServer[key]?.let { d -> e = e.copy(description = d) }
+                }
+                // Replace the link-parsed typed profile (no `extra` fronting block, no routing) with the
+                // verbatim Happ config so it runs identically to Happ. Match by NAME first — several
+                // servers share one host:port (same server, different routing), so server:port alone is
+                // ambiguous; fall back to it only when exactly one verbatim config has that endpoint.
+                if (verbatimXhttp.isNotEmpty() &&
+                    e.proxy != null &&
+                    e.proxy?.rawXrayConfig.isNullOrBlank()
+                ) {
+                    val sp = "${e.proxy?.server}:${e.proxy?.serverPort}"
+                    val match = verbatimXhttp.firstOrNull { it.first.isNotBlank() && it.first == e.name.trim() }
+                        ?: verbatimXhttp.singleOrNull { it.second == sp }
+                    if (match != null) {
+                        e = e.copy(
+                            proxy = e.proxy!!.copy(rawXrayConfig = match.third),
+                            core = ProxyCore.Xray,
+                        )
+                    }
+                }
+                // FakeDNS: attach to locations that don't already have one and aren't verbatim Xray.
+                if (fakeDnsSpec != null &&
+                    e.fakeDns == null &&
+                    e.proxy?.rawXrayConfig.isNullOrBlank() &&
+                    e.proxy?.network != ProxyProfile.NETWORK_XHTTP
+                ) {
+                    e = e.copy(fakeDns = fakeDnsSpec)
+                }
+                if (e !== entry) e.normalized() else entry
+            }
+        )
+        return parsed.copy(bundle = enriched)
+    }
+
+    /**
+     * Maps `"server:port"` → per-server description (`meta.serverDescription`) from a rich Xray
+     * subscription body (Happ-UA variant). Used to attach descriptions to locations parsed from the
+     * user's chosen-UA body (default YPtun → plain links that carry no `meta`), the same way FakeDNS is
+     * recovered. Empty when the body has no descriptions.
+     */
+    private fun serverDescriptionsFromSubscriptionBody(body: String): Map<String, String> {
+        val element = runCatching { json.parseToJsonElement(body.trim()) }.getOrNull() ?: return emptyMap()
+        val configs = when {
+            element is JsonObject -> listOf(element)
+            else -> runCatching { element.jsonArray }.getOrNull()
+                ?.mapNotNull { it.jsonObjectOrNull() } ?: return emptyMap()
+        }
+        val out = mutableMapOf<String, String>()
+        val proxyProtocols = setOf("vless", "vmess", "trojan", "shadowsocks")
+        for (root in configs) {
+            val desc = root["meta"]?.jsonObjectOrNull()?.string("serverDescription")
+                ?.takeIf { it.isNotBlank() } ?: continue
+            val outbounds = runCatching { root["outbounds"]?.jsonArray }.getOrNull()
+                ?.mapNotNull { it.jsonObjectOrNull() } ?: continue
+            val proxyOutbound = outbounds.firstOrNull {
+                it.string("protocol")?.lowercase() in proxyProtocols
+            } ?: continue
+            val settings = proxyOutbound["settings"]?.jsonObjectOrNull()
+            val endpoint = settings?.get("vnext")?.let { runCatching { it.jsonArray }.getOrNull() }
+                ?: settings?.get("servers")?.let { runCatching { it.jsonArray }.getOrNull() }
+            val first = endpoint?.firstOrNull()?.jsonObjectOrNull() ?: continue
+            val server = first.string("address") ?: continue
+            val port = first["port"]?.jsonPrimitive?.intOrNull ?: continue
+            out["$server:$port"] = desc
+        }
+        return out
+    }
+
+    /**
+     * Full verbatim Xray configs (as JSON text) for the xhttp/splithttp proxies — and for every config that
+     * brings its own routing/DNS ([bringsOwnRouting]) — in a rich Happ-UA subscription body. xhttp carries a domain-fronting `extra` block (seqKey / sessionKey / xPadding*
+     * / extra.host …) that a bare `vless://` link from the default-UA body can't fully reproduce — so
+     * when the main fetch parsed such a location from a link, we swap in the verbatim config (keeping the
+     * link's clean name) and run it as-is on Xray. Returns Triple(remarks/name, "server:port", json);
+     * callers match by NAME first since several xhttp configs commonly share one server:port (same host,
+     * different routing) and the panel even rotates the reality shortId per fetch.
+     */
+    private fun verbatimXhttpConfigs(body: String): List<Triple<String, String, String>> {
+        val element = runCatching { json.parseToJsonElement(body.trim()) }.getOrNull() ?: return emptyList()
+        val configs = when {
+            element is JsonObject -> listOf(element)
+            else -> runCatching { element.jsonArray }.getOrNull()
+                ?.mapNotNull { it.jsonObjectOrNull() } ?: return emptyList()
+        }
+        val proxyProtocols = setOf("vless", "vmess", "trojan", "shadowsocks")
+        val out = mutableListOf<Triple<String, String, String>>()
+        for (root in configs) {
+            val outbounds = runCatching { root["outbounds"]?.jsonArray }.getOrNull()
+                ?.mapNotNull { it.jsonObjectOrNull() } ?: continue
+            val proxyOutbound = outbounds.firstOrNull {
+                it.string("protocol")?.lowercase() in proxyProtocols
+            } ?: continue
+            val net = proxyOutbound["streamSettings"]?.jsonObjectOrNull()?.string("network")?.lowercase()
+            if (net != "xhttp" && net != "splithttp" && !bringsOwnRouting(root)) continue
+            val settings = proxyOutbound["settings"]?.jsonObjectOrNull()
+            val endpoint = settings?.get("vnext")?.let { runCatching { it.jsonArray }.getOrNull() }
+                ?: settings?.get("servers")?.let { runCatching { it.jsonArray }.getOrNull() }
+            val first = endpoint?.firstOrNull()?.jsonObjectOrNull() ?: continue
+            val server = first.string("address") ?: continue
+            val port = first["port"]?.jsonPrimitive?.intOrNull ?: continue
+            val name = root.string("remarks")?.trim().orEmpty()
+            out += Triple(name, "$server:$port", root.toString())
+        }
+        return out
+    }
+
+    /** Parses a rich Xray subscription body (array or single object) and returns its FakeDNS spec, or null. */
+    private fun fakeDnsSpecFromSubscriptionBody(body: String): FakeDnsSpec? {
+        val element = runCatching { json.parseToJsonElement(body.trim()) }.getOrNull() ?: return null
+        val config = when {
+            element is JsonObject -> element
+            else -> runCatching { element.jsonArray }.getOrNull()
+                ?.firstNotNullOfOrNull { it.jsonObjectOrNull()?.takeIf { o -> o["fakedns"] != null } }
+        } ?: return null
+        return fakeDnsSpecFromXray(config)
+    }
+
+    private suspend fun resolveImportSource(
+        text: String,
+        requestMode: SubscriptionRequestMode,
+        subscriptionProxy: SubscriptionFetchProxy?,
+        forceHapp: Boolean = false
+    ): ImportSource? {
+        if (text.isBlank()) return null
+
+        if (!text.isHttpUrl()) {
+            return ImportSource(content = text.normalizedImportText())
+        }
+
+        val downloaded = downloadTextFromUrl(
+            url = text,
+            requestMode = requestMode,
+            subscriptionProxy = subscriptionProxy,
+            forceHapp = forceHapp
+        ) ?: return null
+        return downloaded.content
+            .normalizedImportText()
+            .takeIf { it.isNotBlank() }
+            ?.let {
+                ImportSource(
+                    content = it,
+                    subscriptionUrl = text.trim(),
+                    updateIntervalHours = downloaded.updateIntervalHours,
+                    requestMode = requestMode,
+                    profileTitle = downloaded.profileTitle,
+                    userInfo = downloaded.userInfo,
+                    infoJson = downloaded.infoJson,
+                    fakednsJson = downloaded.fakednsJson,
+                    supportUrl = downloaded.supportUrl,
+                    webPageUrl = downloaded.webPageUrl,
+                    announce = downloaded.announce,
+                    providerId = downloaded.providerId,
+                    subscriptionId = downloaded.subscriptionId
+                )
+            }
+    }
+
+    /** Resolves the user's subscription User-Agent choice ([SubscriptionUserAgentHolder]) to a string. */
+    private fun subscriptionUserAgent(): String =
+        if (SubscriptionUserAgentHolder.mode == AppBehaviorSettings.SUB_UA_YPTUN) {
+            CurrentAppInfo.userAgent
+        } else {
+            AppBehaviorSettings.HAPP_USER_AGENT
+        }
+
+    private suspend fun downloadTextFromUrl(
+        url: String,
+        requestMode: SubscriptionRequestMode,
+        subscriptionProxy: SubscriptionFetchProxy?,
+        forceHapp: Boolean = false
+    ): DownloadedSubscription? {
+        val userAgent = if (forceHapp) AppBehaviorSettings.HAPP_USER_AGENT else subscriptionUserAgent()
+        val hwid = if (requestMode == SubscriptionRequestMode.Identity) {
+            deviceIdentityProvider.hwid()
+        } else {
+            null
+        }
+        val appId = if (requestMode == SubscriptionRequestMode.Identity) {
+            runCatching { deviceIdentityProvider.appId() }.getOrNull()
+        } else {
+            null
+        }
+        val client = if (subscriptionProxy == null) {
+            httpClient
+        } else {
+            createProxyHttpClient(subscriptionProxy)
+        }
+
+        return try {
+            withProxyAuthentication(subscriptionProxy) {
+                val response = runCatching {
+                    client.get(url) {
+                        headers {
+                            append(
+                                HttpHeaders.Accept,
+                                // Prefer JSON so Remnawave panels return the rich body (user{} with
+                                // expiresAt + traffic) instead of bare base64 links; our parser handles
+                                // both the JSON `links[]` and base64/plain bodies.
+                                "application/json, text/plain, text/markdown, application/octet-stream, */*"
+                            )
+                            // Panels do User-Agent content-negotiation: our own "YPtun/x" (and a browser
+                            // UA) get only bare base64 vless links, while a recognised client UA gets the
+                            // RICH per-server Xray JSON (with dns.hosts / routing / FAKEDNS). We support
+                            // that JSON (parseRawXray), and it's the only way to receive the server's
+                            // FakeDNS config — so always present as Happ, the de-facto "full config" UA.
+                            append(HttpHeaders.UserAgent, userAgent)
+                            if (requestMode == SubscriptionRequestMode.Identity) {
+                                append("x-hwid", hwid.orEmpty())
+                                if (!appId.isNullOrBlank()) append(HEADER_APP_ID, appId)
+                                // Remnawave HWID device-limit descriptors.
+                                append("x-device-os", DeviceInfo.os)
+                                append("x-ver-os", DeviceInfo.osVersion)
+                                append("x-device-model", DeviceInfo.model)
+                            }
+                        }
+                    }
+                }.getOrNull() ?: return@withProxyAuthentication null
+
+                if (response.status.value !in 200..299) {
+                    return@withProxyAuthentication null
+                }
+
+                val content = runCatching {
+                    response.bodyAsText()
+                }.getOrNull()?.takeIf { it.isNotBlank() }
+                    ?: return@withProxyAuthentication null
+
+                // Best-effort: Remnawave exposes the rich JSON (user.expiresAt + traffic) at <url>/info;
+                // the plain subscription endpoint returns only base64 links and expire=0. Failures are
+                // ignored (non-Remnawave panels simply 404 here).
+                val infoJson = runCatching {
+                    val infoResponse = client.get(url.trim().trimEnd('/') + "/info") {
+                        headers {
+                            append(HttpHeaders.Accept, "application/json")
+                            append(HttpHeaders.UserAgent, userAgent)
+                            if (requestMode == SubscriptionRequestMode.Identity) {
+                                append("x-hwid", hwid.orEmpty())
+                                if (!appId.isNullOrBlank()) append(HEADER_APP_ID, appId)
+                            }
+                        }
+                    }
+                    if (infoResponse.status.value in 200..299) infoResponse.bodyAsText() else null
+                }.getOrNull()?.takeIf { it.isNotBlank() }
+
+                // FakeDNS enrichment: the server's fakeip pool + dns.hosts only ship in the rich Xray
+                // JSON returned under the "Happ/1.0" UA. The MAIN fetch above keeps the user's chosen UA
+                // (default YPtun → clean names/links), so do a SEPARATE Happ-UA fetch here purely to
+                // recover the FakeDNS config and attach it later. Skipped (reuse main) when the main UA
+                // already is Happ. Best-effort: any failure just means no FakeDNS.
+                val fakednsJson = if (userAgent == AppBehaviorSettings.HAPP_USER_AGENT) {
+                    content
+                } else {
+                    runCatching {
+                        val happResponse = client.get(url) {
+                            headers {
+                                append(HttpHeaders.Accept, "application/json, text/plain, */*")
+                                append(HttpHeaders.UserAgent, AppBehaviorSettings.HAPP_USER_AGENT)
+                                if (requestMode == SubscriptionRequestMode.Identity) {
+                                    append("x-hwid", hwid.orEmpty())
+                                    if (!appId.isNullOrBlank()) append(HEADER_APP_ID, appId)
+                                }
+                            }
+                        }
+                        if (happResponse.status.value in 200..299) happResponse.bodyAsText() else null
+                    }.getOrNull()?.takeIf { it.trimStart().startsWith("[") || it.trimStart().startsWith("{") }
+                }
+
+                DownloadedSubscription(
+                    content = content,
+                    updateIntervalHours = response.profileUpdateIntervalHours(),
+                    profileTitle = response.headers["profile-title"]?.let { decodeProfileTitle(it) },
+                    userInfo = response.headers["subscription-userinfo"]?.trim(),
+                    infoJson = infoJson,
+                    fakednsJson = fakednsJson,
+                    // Remnawave also advertises a support link, a subscription web page and an
+                    // announcement via headers (the last is often base64-wrapped like profile-title).
+                    supportUrl = response.headers["support-url"]?.let { decodeMaybeBase64Header(it) },
+                    webPageUrl = response.headers["profile-web-page-url"]?.let { decodeMaybeBase64Header(it) },
+                    announce = response.headers["announce"]?.let { decodeMaybeBase64Header(it) },
+                    // Happ/Remnawave provider tracking id (lowercase `providerid`; lookup is
+                    // case-insensitive). Plain string — not base64.
+                    providerId = response.headers["providerid"]?.trim()?.takeIf { it.isNotBlank() },
+                    subscriptionId = response.headers["profile-id"]?.let { decodeMaybeBase64Header(it) }
+                        ?: response.headers["subscription-id"]?.trim()?.takeIf { it.isNotBlank() }
+                )
+            }
+        } finally {
+            if (subscriptionProxy != null) {
+                client.close()
+            }
+        }
+    }
+
+    private fun String.isHttpUrl(): Boolean {
+        val value = trim().lowercase()
+        return value.startsWith("http://") || value.startsWith("https://")
+    }
+
+    private fun String.normalizedImportText(): String {
+        return trim().removePrefix(UTF8_BOM).trim()
+    }
+
+    private suspend fun migrateLegacyBundle(): LocationBundleV4 {
+        val legacy = dataSource.loadLegacyLocations().mapNotNull { (storageId, text) ->
+            parseSingleLocation(text, storageId)
+        }
+
+        val active = dataSource.loadLegacyActiveLocationId()?.takeIf { id ->
+            legacy.any { it.storageId == id }
+        }
+
+        return LocationBundleV4(
+            activeLocationId = active,
+            locations = legacy
+        ).normalized()
+    }
+
+    private fun parseImport(
+        text: String,
+        subscriptionUrl: String? = null,
+        updateIntervalHours: Int? = null,
+        subscriptionMetadata: SubscriptionMetadata? = null
+    ): ParsedImport? {
+        // Unified multi-protocol catalogue (schema "vpn.servers.full"): ONE file carrying vless +
+        // AmneziaWG + WDTT arrays at once. Must run before the line parsers so the vless://… strings
+        // embedded in the JSON are never mistaken for standalone share links.
+        parseUnifiedServersJson(text, subscriptionUrl, subscriptionMetadata)?.let {
+            return ParsedImport(it, ImportMode.Additive)
+        }
+
+        // ONE subscription may mix link families — olcrtc:// next to vless:// is the common case —
+        // so every line-based parser gets a go at the SAME text and their results are concatenated.
+        // Stopping at the first parser that matched is what dropped every vless:// server from a
+        // subscription that also had olcrtc:// links (and, for a base64 body, the olcrtc:// ones,
+        // which the parser never even saw). Each parser picks up only its own scheme, so no line is
+        // imported twice.
+        val linkText = SubscriptionDecoder.toLinkText(text)
+        val linkBundles = mutableListOf<LocationBundleV4>()
+
+        // Our own universal inbound link (yptun://inbound?…&d=<base64 LocationConfig JSON>): carries
+        // the WHOLE location (engine, transport, proxy/AWG/VK outbound, every toggle).
+        parseYptunInboundText(linkText, subscriptionUrl)?.let { linkBundles += it }
+
+        parseOlcRtcText(linkText, subscriptionUrl, updateIntervalHours)?.let { linkBundles += it }
+
+        // VK-TURN share links (freeturn://): WireGuard-over-VK locations.
+        parseFreeturnText(linkText, subscriptionUrl)?.let { linkBundles += it }
+
+        // qWDTT quick links (qwdtt://config?…): VK-TURN locations on the WDTT core.
+        parseQwdttText(linkText, subscriptionUrl)?.let { linkBundles += it }
+
+        if (linkBundles.isEmpty()) {
+            // AmneziaWG .conf (whole wg-quick INI with obf knobs) → a Standard location whose proxy is
+            // the AmneziaWG transport. Checked before the proxy parser (which splits into per-line links
+            // and would not see the multi-line config).
+            parseAmneziaWgText(text, subscriptionUrl)?.let {
+                return ParsedImport(it, ImportMode.Additive)
+            }
+
+            // Full raw Xray config — a single object OR an array of them (Happ/Remnawave subscriptions
+            // ship one complete Xray config per server, each with its own dns.hosts / routing / fakedns).
+            // MUST run before the proxy/sing-box parsers, otherwise the config is downgraded to a bare
+            // sing-box vless and its fakedns / RU-direct DNS hosts are lost.
+            parseRawXray(text, subscriptionUrl)?.let {
+                return ParsedImport(it, ImportMode.Additive)
+            }
+        }
+
+        // Proxy share links / subscriptions (vless, vmess, trojan, ss, base64 blobs and
+        // JSON panels with a "links" array) become sing-box (Standard) locations.
+        parseProxyText(linkText, subscriptionUrl, subscriptionMetadata)?.let { linkBundles += it }
+
+        mergeParsedBundles(linkBundles)?.let {
+            return ParsedImport(it, ImportMode.Additive)
+        }
+
+        // Raw sing-box config (full config with "outbounds", a single outbound object, or an
+        // array of outbounds) → Standard locations carrying the outbound JSON verbatim.
+        parseRawSingBox(text, subscriptionUrl)?.let {
+            return ParsedImport(it, ImportMode.Additive)
+        }
+
+        if (!text.startsWith("{") || !text.endsWith("}")) return null
+
+        val root = runCatching {
+            json.parseToJsonElement(text).jsonObject
+        }.getOrNull() ?: return null
+
+        parseBundle(root, subscriptionUrl, updateIntervalHours)?.let {
+            return ParsedImport(it, ImportMode.Restore)
+        }
+
+        return parseSingleLocation(root, null, subscriptionUrl)?.let {
+            ParsedImport(
+                LocationBundleV4(
+                    activeLocationId = it.storageId,
+                    locations = listOf(
+                        it.copy(
+                            metadata = it.metadata.withSubscriptionInterval(updateIntervalHours)
+                        ).normalized()
+                    )
+                ),
+                ImportMode.Additive
+            )
+        }
+    }
+
+    /**
+     * Concatenates the bundles produced by the per-scheme link parsers of ONE import, keeping storage
+     * ids unique across them (two families can slug the same name). The first entry stays active, so
+     * a mixed subscription behaves like a single-family one.
+     */
+    private fun mergeParsedBundles(bundles: List<LocationBundleV4>): LocationBundleV4? {
+        if (bundles.isEmpty()) return null
+        bundles.singleOrNull()?.let { return it }
+
+        val usedStorageIds = mutableSetOf<String>()
+        val locations = bundles.flatMap { it.locations }.map { entry ->
+            entry.copy(storageId = uniqueStorageId(entry.storageId, usedStorageIds))
+        }
+        return LocationBundleV4(
+            activeLocationId = locations.firstOrNull()?.storageId,
+            locations = locations
+        )
+    }
+
+    private fun mergeImportedBundle(
+        current: LocationBundleV4?,
+        imported: LocationBundleV4,
+        replaceMatchingStorageIds: Boolean
+    ): LocationBundleV4 {
+        val currentBundle = current?.normalized()
+        if (currentBundle == null || currentBundle.locations.isEmpty()) {
+            return imported
+        }
+
+        val currentStorageIds = currentBundle.locations.mapTo(mutableSetOf()) { it.storageId }
+        val existingStorageIds = currentBundle.locations.mapTo(mutableSetOf()) { it.storageId }
+
+        val importedByStorageId = if (replaceMatchingStorageIds) {
+            imported.locations.associateBy { it.storageId }
+        } else {
+            emptyMap()
+        }
+        val replacedStorageIds = importedByStorageId.keys.intersect(currentStorageIds)
+
+        val mergedLocations = currentBundle.locations
+            .map { existing ->
+                importedByStorageId[existing.storageId]?.also {
+                    existingStorageIds.add(it.storageId)
+                } ?: existing
+            }
+            .toMutableList()
+
+        val importedIdMap = mutableMapOf<String, String>()
+
+        imported.locations.forEach { entry ->
+            if (replaceMatchingStorageIds && entry.storageId in replacedStorageIds) return@forEach
+
+            val storageId = uniqueStorageId(entry.storageId, existingStorageIds)
+            importedIdMap[entry.storageId] = storageId
+            mergedLocations += entry.copy(storageId = storageId).normalized()
+        }
+
+        val importedActive = imported.activeLocationId
+            ?.let { id -> importedIdMap[id] ?: id }
+            ?.takeIf { id -> mergedLocations.any { it.storageId == id } }
+
+        // The CURRENT selection wins over the imported bundle's on an additive import: pasting a
+        // config must never re-point the active location, least of all while the VPN is up — the
+        // list marks the active entry as the connected one and starts drawing its traffic on the
+        // freshly pasted config while the tunnel still runs the old one. Only a Restore (a whole
+        // exported bundle) is allowed to carry its own active id back in.
+        val currentActive = currentBundle.activeLocationId
+            ?.takeIf { id -> mergedLocations.any { it.storageId == id } }
+        val active = if (replaceMatchingStorageIds) {
+            importedActive ?: currentActive
+        } else {
+            currentActive ?: importedActive
+        } ?: mergedLocations.firstOrNull()?.storageId
+
+        return currentBundle.copy(
+            activeLocationId = active,
+            locations = mergedLocations
+        )
+    }
+
+    private fun parseBundle(
+        root: JsonObject,
+        subscriptionUrl: String? = null,
+        updateIntervalHours: Int? = null
+    ): LocationBundleV4? {
+        val locationsElement = root["locations"] ?: return null
+
+        val locations = runCatching {
+            locationsElement.jsonArray
+        }.getOrNull()?.mapNotNull { element ->
+            val item = element.jsonObjectOrNull() ?: return@mapNotNull null
+
+            decodeLocationEntry(item, subscriptionUrl)?.let {
+                return@mapNotNull it.copy(
+                    metadata = it.metadata.withSubscriptionInterval(updateIntervalHours)
+                ).normalized()
+            }
+
+            val storageId = item.string("storage_id")
+                ?: item.string("storageId")
+                ?: item.string("id")?.let { "imported_${it.storageSlug()}" }
+
+            parseSingleLocation(item, storageId, subscriptionUrl)?.let { entry ->
+                entry.copy(
+                    metadata = entry.metadata.withSubscriptionInterval(updateIntervalHours)
+                ).normalized()
+            }
+        } ?: return null
+
+        val version = root["version"]?.jsonPrimitive?.intOrNull ?: 3
+        if (version < 3 && locations.isEmpty()) return null
+
+        return LocationBundleV4(
+            activeLocationId = root.string("active_location_id")
+                ?: root.string("activeLocationId"),
+            locations = locations
+        )
+    }
+
+    private fun parseSingleLocation(
+        text: String,
+        fallbackStorageId: String?,
+        subscriptionUrl: String? = null
+    ): LocationEntry? {
+        val root = runCatching {
+            json.parseToJsonElement(text).jsonObject
+        }.getOrNull() ?: return null
+
+        parseBundle(root, subscriptionUrl)?.let { bundle ->
+            return bundle.normalized().locations.firstOrNull()
+        }
+
+        return parseSingleLocation(root, fallbackStorageId, subscriptionUrl)
+    }
+
+    private fun parseSingleLocation(
+        root: JsonObject,
+        fallbackStorageId: String?,
+        subscriptionUrl: String? = null
+    ): LocationEntry? {
+        decodeLocationEntry(root, subscriptionUrl)?.let { return it }
+
+        val source = root["location"]?.jsonObjectOrNull()
+            ?: root["hysteria"]?.jsonObjectOrNull()
+            ?: root
+
+        val provider = firstNotBlank(
+            source.string("auth_provider"),
+            source.string("authProvider"),
+            source.string("bypass_provider"),
+            source.string("bypassProvider"),
+            source.string("provider"),
+            root["turn"]?.jsonObjectOrNull()?.string("type"),
+            root.string("auth_provider"),
+            root.string("authProvider"),
+            root.string("bypass_provider"),
+            root.string("bypassProvider"),
+            root.string("provider")
+        )
+
+        val transportArgs = firstNotBlank(
+            source.string("transport_args"),
+            source.string("transportArgs"),
+            source.string("args"),
+            root.string("transport_args"),
+            root.string("transportArgs"),
+            root.string("args")
+        )
+
+        val vp8Fps = firstInt(
+            source.int("vp8_fps"),
+            source.int("vp8Fps"),
+            root.int("vp8_fps"),
+            root.int("vp8Fps"),
+            transportArgInt(transportArgs, "-vp8-fps")
+        ) ?: LocationConfig.DEFAULT_VP8_FPS
+
+        val vp8Batch = firstInt(
+            source.int("vp8_batch"),
+            source.int("vp8Batch"),
+            root.int("vp8_batch"),
+            root.int("vp8Batch"),
+            transportArgInt(transportArgs, "-vp8-batch")
+        ) ?: LocationConfig.DEFAULT_VP8_BATCH
+
+        val location = LocationConfig(
+            name = firstNotBlank(source.string("name"), root.string("name")),
+            id = firstNotBlank(
+                source.string("id"),
+                source.string("room_id"),
+                source.string("server"),
+                root.string("id")
+            ),
+            key = firstNotBlank(
+                source.string("key"),
+                source.string("encryption_key"),
+                source.string("password"),
+                root.string("key")
+            ),
+            bypassProvider = provider,
+            transport = firstNotBlank(
+                source.string("transport"),
+                root.string("transport"),
+                if (transportArgs.isNotBlank()) LocationConfig.TRANSPORT_VP8CHANNEL else null
+            ),
+            vp8Fps = vp8Fps,
+            vp8Batch = vp8Batch
+        ).normalized()
+
+        if (!location.isComplete()) return null
+
+        val storageId = firstNotBlank(
+            fallbackStorageId,
+            root.string("storage_id"),
+            root.string("storageId"),
+            source.string("storage_id"),
+            source.string("storageId"),
+            "imported_${location.storageSlug()}"
+        )
+
+        return LocationEntry.from(storageId, location, subscriptionUrl = subscriptionUrl)
+    }
+
+    /** Parses one or more `yptun://inbound…` links (one per line) into Standard/custom locations. */
+    private fun parseYptunInboundText(
+        text: String,
+        subscriptionUrl: String? = null
+    ): LocationBundleV4? {
+        if (!text.contains(YptunInboundCodec.PREFIX)) return null
+        val usedStorageIds = mutableSetOf<String>()
+        // ONE link that arrived wrapped is still one link: chat clients and QR overlays break a long
+        // base64 payload across lines, and splitting by line then kept only the first fragment, so the
+        // payload never inflated and the paste read as "no valid config". Only unwrap when the whole
+        // text is a single link — a genuine one-link-per-line list must keep its lines.
+        val single = text.filterNot { it.isWhitespace() }
+        val source = if (
+            single.startsWith(YptunInboundCodec.PREFIX) &&
+            single.indexOf(YptunInboundCodec.PREFIX, startIndex = 1) < 0
+        ) {
+            single
+        } else {
+            text
+        }
+        val entries = source.lineSequence()
+            .map { it.normalizedImportText() }
+            .filter { it.startsWith(YptunInboundCodec.PREFIX) }
+            .mapNotNull { YptunInboundCodec.parse(it) }
+            .mapIndexed { index, parsed ->
+                val location = parsed.normalized()
+                val base = location.storageSlug().ifBlank { "location_${index + 1}" }
+                val storageId = uniqueStorageId("imported_$base", usedStorageIds)
+                LocationEntry.from(
+                    storageId = storageId,
+                    location = location,
+                    subscriptionUrl = subscriptionUrl,
+                    metadata = null
+                )
+            }
+            .toList()
+        if (entries.isEmpty()) return null
+        return LocationBundleV4(
+            activeLocationId = entries.firstOrNull()?.storageId,
+            locations = entries
+        )
+    }
+
+    private fun parseOlcRtcText(
+        text: String,
+        subscriptionUrl: String? = null,
+        updateIntervalHours: Int? = null
+    ): LocationBundleV4? {
+        if (!text.contains(OLCRTC_URI_PREFIX)) return null
+
+        val subscriptionFields = linkedMapOf<String, String>()
+        val locations = mutableListOf<Pair<ParsedOlcRtcUri, MutableMap<String, String>>>()
+        var localFields: MutableMap<String, String>? = null
+
+        text.lineSequence()
+            .map { it.normalizedImportText() }
+            .filter { it.isNotBlank() }
+            .forEach { line ->
+                when {
+                    line.startsWith(OLCRTC_URI_PREFIX) -> {
+                        parseOlcRtcUri(line)?.let { parsed ->
+                            val fields = linkedMapOf<String, String>()
+                            locations += parsed to fields
+                            localFields = fields
+                        }
+                    }
+
+                    line.startsWith("##") && locations.isNotEmpty() -> {
+                        val (key, value) = parseSubscriptionField(
+                            line.removePrefix("##")
+                        ) ?: return@forEach
+
+                        localFields?.set(key, value)
+                    }
+
+                    line.startsWith("#") -> {
+                        val (key, value) = parseSubscriptionField(
+                            line.removePrefix("#")
+                        ) ?: return@forEach
+
+                        subscriptionFields[key] = value
+                    }
+                }
+            }
+
+        if (locations.isEmpty()) return null
+
+        // An olcRTC subscription (docs/sub.md) states its own refresh period ("#refresh: 10m"); a panel
+        // header, when there is one, still wins.
+        val subscriptionMetadata = buildSubscriptionMetadata(subscriptionFields)
+            .withSubscriptionInterval(updateIntervalHours ?: refreshIntervalHours(subscriptionFields["refresh"]))
+        val usedStorageIds = mutableSetOf<String>()
+
+        val entries = locations.mapIndexed { index, (parsed, fields) ->
+            val metadata = buildLocationMetadata(
+                fields = fields,
+                mimo = parsed.mimo,
+                subscription = subscriptionMetadata
+            )
+            val location = parsed.location.copy(
+                name = firstNotBlank(
+                    metadata?.name,
+                    parsed.mimo,
+                    parsed.location.name
+                )
+            ).normalized()
+            val base = location.storageSlug().ifBlank { "location_${index + 1}" }
+            val storageId = uniqueStorageId("imported_$base", usedStorageIds)
+            LocationEntry.from(
+                storageId = storageId,
+                location = location,
+                subscriptionUrl = subscriptionUrl,
+                metadata = metadata
+            )
+        }
+
+        return LocationBundleV4(
+            activeLocationId = entries.firstOrNull()?.storageId,
+            locations = entries
+        )
+    }
+
+    /**
+     * Parses proxy share links / subscription bodies (vless/vmess/trojan/ss, base64 blobs,
+     * or JSON panels exposing a "links" array) into sing-box [EngineType.Standard] locations.
+     * Storage ids are derived from server:port so subscription refresh replaces stable entries.
+     */
+    /**
+     * Builds subscription metadata (name + traffic) from panel response headers used by
+     * Remnawave / 3x-ui / Marzban: `profile-title` (name) and `subscription-userinfo`
+     * (`upload=…; download=…; total=…; expire=…`).
+     */
+    private fun subscriptionMetadataFromHeaders(
+        profileTitle: String?,
+        userInfo: String?,
+        supportUrl: String? = null,
+        webPageUrl: String? = null,
+        announce: String? = null,
+        providerId: String? = null,
+        subscriptionId: String? = null
+    ): SubscriptionMetadata? {
+        val name = profileTitle?.trim()?.takeIf { it.isNotBlank() }
+
+        var used: String? = null
+        var available: String? = null
+        var expiresAtEpochMs: Long? = null
+        if (!userInfo.isNullOrBlank()) {
+            val fields = userInfo.split(';')
+                .mapNotNull { part ->
+                    val kv = part.split('=', limit = 2)
+                    if (kv.size == 2) kv[0].trim().lowercase() to kv[1].trim() else null
+                }
+                .toMap()
+            val upload = fields["upload"]?.toLongOrNull() ?: 0L
+            val download = fields["download"]?.toLongOrNull() ?: 0L
+            val total = fields["total"]?.toLongOrNull()
+            if (fields.containsKey("upload") || fields.containsKey("download") || total != null) {
+                used = formatTrafficBytes(upload + download)
+                available = if (total == null || total <= 0L) "∞" else formatTrafficBytes(total)
+            }
+            // `expire=<unix seconds>` (0 / absent = no expiry) — the standard subscription-userinfo field.
+            expiresAtEpochMs = fields["expire"]?.toLongOrNull()?.takeIf { it > 0L }?.let { it * 1_000L }
+        }
+
+        val support = supportUrl?.trim()?.takeIf { it.isNotBlank() }
+        val webPage = webPageUrl?.trim()?.takeIf { it.isNotBlank() }
+        val announcement = announce?.trim()?.takeIf { it.isNotBlank() }
+        val provider = providerId?.trim()?.takeIf { it.isNotBlank() }
+        val subId = subscriptionId?.trim()?.takeIf { it.isNotBlank() }
+
+        if (name == null && used == null && available == null && expiresAtEpochMs == null &&
+            support == null && webPage == null && announcement == null && provider == null && subId == null
+        ) {
+            return null
+        }
+        return SubscriptionMetadata(
+            id = subId,
+            name = name,
+            used = used,
+            available = available,
+            expiresAtEpochMs = expiresAtEpochMs,
+            supportUrl = support,
+            webPageUrl = webPage,
+            announce = announcement,
+            providerId = provider
+        ).normalized()
+    }
+
+    /**
+     * Builds subscription metadata from a Remnawave-style JSON subscription BODY, e.g.
+     * `{ "user": { "expiresAt": "2099-05-03T20:59:00.000Z", "trafficUsed": "113.14 GiB",
+     * "trafficLimit": "0", ... }, "links": [...] }`. Pulls the expiry date and the human traffic
+     * counters that the response headers don't carry. Returns null for non-JSON bodies (base64 / plain
+     * link lists) or when no usable field is present.
+     */
+    private fun subscriptionMetadataFromBody(content: String): SubscriptionMetadata? {
+        val trimmed = content.trim()
+        if (!trimmed.startsWith("{")) return null
+        val root = runCatching { json.parseToJsonElement(trimmed).jsonObject }.getOrNull() ?: return null
+        // The `/info` endpoint wraps it as {response:{user:{…}}}; the bare body uses {user:{…}}.
+        val user = root["response"]?.jsonObjectOrNull()?.get("user")?.jsonObjectOrNull()
+            ?: root["user"]?.jsonObjectOrNull()
+            ?: return null
+
+        val expiresAtEpochMs = IsoTime.parseIsoToEpochMs(user.string("expiresAt"))
+        val subId = (user.string("id") ?: user.string("shortUuid") ?: user.string("uuid"))
+            ?.trim()?.takeIf { it.isNotBlank() }
+        val support = user.string("supportUrl")?.trim()?.takeIf { it.isNotBlank() }
+        val used = user.string("trafficUsed")?.trim()?.takeIf { it.isNotBlank() && it != "0" }
+        val limit = user.string("trafficLimit")?.trim()
+        // trafficLimit "0" / blank = unlimited (NO_RESET plans report a 0 limit).
+        val available = when {
+            limit.isNullOrBlank() || limit == "0" || limit == "0 B" -> if (used != null) "∞" else null
+            else -> limit
+        }
+
+        if (expiresAtEpochMs == null && used == null && available == null && subId == null && support == null) return null
+        return SubscriptionMetadata(
+            id = subId,
+            used = used,
+            available = available,
+            expiresAtEpochMs = expiresAtEpochMs,
+            supportUrl = support
+        ).normalized().takeUnless { it.isEmpty() }
+    }
+
+    /** Field-wise merge: [primary] wins, [secondary] fills the gaps; the name prefers the header title. */
+    private fun mergeSubscriptionMetadata(
+        primary: SubscriptionMetadata?,
+        secondary: SubscriptionMetadata?
+    ): SubscriptionMetadata? {
+        if (primary == null) return secondary
+        if (secondary == null) return primary
+        return SubscriptionMetadata(
+            id = primary.id ?: secondary.id,
+            name = secondary.name ?: primary.name,
+            update = primary.update ?: secondary.update,
+            refresh = primary.refresh ?: secondary.refresh,
+            color = primary.color ?: secondary.color,
+            icon = primary.icon ?: secondary.icon,
+            used = primary.used ?: secondary.used,
+            available = primary.available ?: secondary.available,
+            updateIntervalHours = primary.updateIntervalHours ?: secondary.updateIntervalHours,
+            lastRefreshAtEpochMs = primary.lastRefreshAtEpochMs ?: secondary.lastRefreshAtEpochMs,
+            expiresAtEpochMs = primary.expiresAtEpochMs ?: secondary.expiresAtEpochMs,
+            lastAttemptAtEpochMs = primary.lastAttemptAtEpochMs ?: secondary.lastAttemptAtEpochMs,
+            supportUrl = primary.supportUrl ?: secondary.supportUrl,
+            webPageUrl = primary.webPageUrl ?: secondary.webPageUrl,
+            announce = primary.announce ?: secondary.announce,
+            providerId = primary.providerId ?: secondary.providerId
+        ).normalized().takeUnless { it.isEmpty() }
+    }
+
+    /** Decodes a `profile-title` header, which Remnawave sends as `base64:<payload>`. */
+    private fun decodeProfileTitle(raw: String): String? = decodeMaybeBase64Header(raw)
+
+    /**
+     * Decodes a header value that Remnawave may send either plain or `base64:`-prefixed (used for
+     * `profile-title`, `announce`, and occasionally the URLs). Falls back to the raw value if it isn't
+     * actually base64. Returns null for blank input.
+     */
+    private fun decodeMaybeBase64Header(raw: String): String? {
+        val value = raw.trim()
+        if (value.isEmpty()) return null
+        val decoded = if (value.startsWith("base64:")) {
+            val payload = value.removePrefix("base64:").trim()
+            SubscriptionDecoder.decodeBase64Chunk(payload) ?: payload
+        } else {
+            value
+        }
+        return decoded.trim().takeIf { it.isNotBlank() }
+    }
+
+    /** Formats a byte count into a compact human string, e.g. "230.4 GB". */
+    private fun formatTrafficBytes(bytes: Long): String {
+        if (bytes <= 0L) return "0 B"
+        val units = listOf("B", "KB", "MB", "GB", "TB", "PB")
+        var value = bytes.toDouble()
+        var unitIndex = 0
+        while (value >= 1024.0 && unitIndex < units.size - 1) {
+            value /= 1024.0
+            unitIndex++
+        }
+        val rounded = (value * 10).toLong() / 10.0
+        val text = if (rounded % 1.0 == 0.0) rounded.toLong().toString() else rounded.toString()
+        return "$text ${units[unitIndex]}"
+    }
+
+    /**
+     * Parses a single VK-TURN [FreeturnUriParser.SCHEME] link into a [EngineType.VkTurn] location.
+     * The decoded WireGuard config is stored as [ProxyProfile.rawOutbound]; the per-client VK call
+     * link is left empty for the user to fill in via the location settings before connecting.
+     */
+    private fun parseFreeturnText(
+        text: String,
+        subscriptionUrl: String? = null
+    ): LocationBundleV4? {
+        val usedStorageIds = mutableSetOf<String>()
+        // EVERY freeturn:// line, not just the first: a subscription may list several VK-TURN servers.
+        val entries = text.trim().lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith(FreeturnUriParser.SCHEME, ignoreCase = true) }
+            .mapNotNull { FreeturnUriParser.parse(it) }
+            .map { link -> freeturnEntry(link, subscriptionUrl, usedStorageIds) }
+            .toList()
+        if (entries.isEmpty()) return null
+        return LocationBundleV4(
+            activeLocationId = entries.first().storageId,
+            locations = entries
+        )
+    }
+
+    private fun freeturnEntry(
+        link: FreeturnUriParser.FreeturnLink,
+        subscriptionUrl: String?,
+        usedStorageIds: MutableSet<String>
+    ): LocationEntry {
+        val name = link.comment.ifBlank { "VK-TURN ${link.serverIp}" }
+        val location = if (link.mode == "tcp") {
+            // tcp / Proxy-bonded: the exit is a normal proxy dialled THROUGH the local freeturn tcp
+            // listener. Mirror VkTurnComposer.compose's PROXY branch — rewrite server→127.0.0.1:<listen>
+            // and pin the SNI to the real host (else TLS validates against 127.0.0.1 and resets).
+            val listenPort = LocationConfig.DEFAULT_FREETURN_PORT
+            val base = ShareLinkParser.parse(link.exitProxyLink) ?: ProxyProfile()
+            LocationConfig(
+                name = name,
+                engine = EngineType.VkTurn,
+                proxy = base.copy(
+                    tag = name,
+                    sni = base.sni.ifBlank { base.server },
+                    server = "127.0.0.1",
+                    serverPort = listenPort,
+                ),
+                vkturn = VkTurnConfig(
+                    uri = link.uri,
+                    vkLink = "",
+                    listenPort = listenPort,
+                    outbound = VkTurnConfig.OUTBOUND_PROXY,
+                    outboundProxyLink = link.exitProxyLink,
+                ),
+            ).normalized()
+        } else {
+            LocationConfig(
+                name = name,
+                engine = EngineType.VkTurn,
+                proxy = ProxyProfile(
+                    tag = name,
+                    type = "wireguard",
+                    server = link.serverIp,
+                    serverPort = link.serverPort,
+                    rawOutbound = link.wgOutboundJson,
+                ),
+                vkturn = VkTurnConfig(
+                    uri = link.uri,
+                    vkLink = "",
+                    listenPort = link.listenPort,
+                ),
+            ).normalized()
+        }
+
+        val base = "${link.serverIp}_${link.serverPort}"
+            .lowercase()
+            .map { if (it.isLetterOrDigit()) it else '_' }
+            .joinToString("")
+        val storageId = uniqueStorageId("imported_vkturn_$base", usedStorageIds)
+        return LocationEntry.from(
+            storageId = storageId,
+            location = location,
+            subscriptionUrl = subscriptionUrl,
+        )
+    }
+
+    /**
+     * Parses every [QwdttUriParser.SCHEME] quick link into a WDTT-core [EngineType.VkTurn] location.
+     * The link carries the VK hashes, so the location is immediately connectable (no vkLink prompt);
+     * the WireGuard config is fetched from the wdtt-server at runtime, so there is no proxy profile.
+     */
+    private fun parseQwdttText(
+        text: String,
+        subscriptionUrl: String? = null
+    ): LocationBundleV4? {
+        val usedStorageIds = mutableSetOf<String>()
+        val entries = text.trim().lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith(QwdttUriParser.SCHEME, ignoreCase = true) }
+            .mapNotNull { QwdttUriParser.parse(it) }
+            .map { link ->
+                val name = link.name.ifBlank { "qWDTT ${link.peer}" }
+                val location = LocationConfig(
+                    name = name,
+                    engine = EngineType.VkTurn,
+                    vkturn = VkTurnConfig(
+                        core = VkTurnConfig.CORE_WDTT,
+                        wdttPeer = link.peer,
+                        wdttPassword = link.password,
+                        wdttWorkers = link.workers,
+                        vkLink = link.hashes,
+                        listenPort = link.listenPort.takeIf { it in 1..65535 }
+                            ?: LocationConfig.DEFAULT_FREETURN_PORT,
+                    ),
+                ).normalized()
+                val base = link.peer.lowercase().map { if (it.isLetterOrDigit()) it else '_' }.joinToString("")
+                val storageId = uniqueStorageId("imported_qwdtt_$base", usedStorageIds)
+                LocationEntry.from(storageId = storageId, location = location, subscriptionUrl = subscriptionUrl)
+            }
+            .toList()
+        if (entries.isEmpty()) return null
+        return LocationBundleV4(activeLocationId = entries.first().storageId, locations = entries)
+    }
+
+    /**
+     * Imports the unified `vpn.servers.full` catalogue (vless + awg + wdtt in one JSON) as a flat list
+     * of locations. Storage ids are slugged from the display name + endpoint and de-duplicated, so two
+     * entries sharing a name still get distinct ids.
+     */
+    private fun parseUnifiedServersJson(
+        text: String,
+        subscriptionUrl: String? = null,
+        subscriptionMetadata: SubscriptionMetadata? = null
+    ): LocationBundleV4? {
+        val locations = UnifiedServersJsonParser.parse(text) ?: return null
+        val locationMetadata = subscriptionMetadata?.let { LocationMetadata(subscription = it) }
+
+        val usedStorageIds = mutableSetOf<String>()
+        val entries = locations.map { location ->
+            val endpoint = location.proxy?.server ?: location.vkturn?.wdttPeer ?: ""
+            val base = "imported_unified_${location.name}_$endpoint"
+                .lowercase()
+                .map { if (it.isLetterOrDigit()) it else '_' }
+                .joinToString("")
+            val storageId = uniqueStorageId(base, usedStorageIds)
+            LocationEntry.from(
+                storageId = storageId,
+                location = location,
+                subscriptionUrl = subscriptionUrl,
+                metadata = locationMetadata
+            )
+        }
+        if (entries.isEmpty()) return null
+        return LocationBundleV4(activeLocationId = entries.first().storageId, locations = entries)
+    }
+
+    /** Parses a whole AmneziaWG wg-quick .conf into a [EngineType.Standard] location. */
+    private fun parseAmneziaWgText(text: String, subscriptionUrl: String? = null): LocationBundleV4? {
+        val trimmed = text.trim()
+        if (!AmneziaWgParser.looksLikeAmneziaWg(trimmed)) return null
+        val profile = AmneziaWgParser.parse(trimmed) ?: return null
+        val name = profile.tag.ifBlank { "AmneziaWG" }
+        val location = LocationConfig(
+            name = name,
+            engine = EngineType.Standard,
+            proxy = profile,
+        ).normalized()
+        val base = "${profile.server}_${profile.serverPort}"
+            .lowercase()
+            .map { if (it.isLetterOrDigit()) it else '_' }
+            .joinToString("")
+        val storageId = uniqueStorageId("imported_awg_$base", mutableSetOf())
+        val entry = LocationEntry.from(
+            storageId = storageId,
+            location = location,
+            subscriptionUrl = subscriptionUrl,
+        )
+        return LocationBundleV4(activeLocationId = entry.storageId, locations = listOf(entry))
+    }
+
+    private fun parseProxyText(
+        text: String,
+        subscriptionUrl: String? = null,
+        subscriptionMetadata: SubscriptionMetadata? = null
+    ): LocationBundleV4? {
+        val profiles = ShareLinkParser.parseSubscription(text)
+        if (profiles.isEmpty()) return null
+
+        val locationMetadata = subscriptionMetadata?.let { LocationMetadata(subscription = it) }
+
+        val usedStorageIds = mutableSetOf<String>()
+        val entries = profiles.map { profile ->
+            val location = LocationConfig(
+                name = profile.displayName(),
+                engine = EngineType.Standard,
+                proxy = profile
+            ).normalized()
+            val base = "${profile.server}_${profile.serverPort}"
+                .lowercase()
+                .map { if (it.isLetterOrDigit()) it else '_' }
+                .joinToString("")
+            val storageId = uniqueStorageId("imported_$base", usedStorageIds)
+            LocationEntry.from(
+                storageId = storageId,
+                location = location,
+                subscriptionUrl = subscriptionUrl,
+                metadata = locationMetadata
+            )
+        }
+
+        return LocationBundleV4(
+            activeLocationId = entries.firstOrNull()?.storageId,
+            locations = entries
+        )
+    }
+
+    /**
+     * Parses a raw sing-box config into Standard locations. Accepts a full config object (with
+     * an "outbounds" array), a single outbound object, or an array of outbounds. Each server
+     * outbound (has "type" + "server") is stored verbatim as [ProxyProfile.rawOutbound].
+     */
+    private fun parseRawSingBox(
+        text: String,
+        subscriptionUrl: String? = null
+    ): LocationBundleV4? {
+        val trimmed = text.trim()
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null
+        val element = runCatching { json.parseToJsonElement(trimmed) }.getOrNull() ?: return null
+
+        val outbounds: List<JsonObject> = when {
+            element is JsonObject && element["outbounds"] != null ->
+                runCatching { element["outbounds"]!!.jsonArray }.getOrNull()
+                    ?.mapNotNull { it.jsonObjectOrNull() } ?: return null
+            element is JsonObject -> listOf(element)
+            else -> runCatching { element.jsonArray }.getOrNull()
+                ?.mapNotNull { it.jsonObjectOrNull() } ?: return null
+        }
+
+        val servers = outbounds.filter { it["type"] != null && it["server"] != null }
+        if (servers.isEmpty()) return null
+
+        // A full sing-box config brings its own `route` — the whole point of a JSON subscription. It used
+        // to be dropped on the floor (only the outbound survived), so the app's own routing profile ran
+        // instead. Normalize it once for this config and hang it on every location it produces.
+        val embeddedRoute = (element as? JsonObject)?.let { normalizeSingBoxRoute(it, outbounds) }
+        // Its FakeDNS (fakeip) was dropped too — the Xray branch has always extracted an equivalent
+        // spec (fakeDnsSpecFromXray), so a sing-box JSON subscription silently lost its synthetic-IP
+        // pool while the same subscription in Xray form kept it.
+        val fakeDnsSpec = (element as? JsonObject)?.let { fakeDnsSpecFromSingBox(it) }
+
+        val usedStorageIds = mutableSetOf<String>()
+        val entries = servers.mapIndexedNotNull { index, outbound ->
+            val server = outbound.string("server") ?: return@mapIndexedNotNull null
+            val port = outbound["server_port"]?.jsonPrimitive?.intOrNull ?: return@mapIndexedNotNull null
+            val type = outbound.string("type") ?: return@mapIndexedNotNull null
+            val tag = outbound.string("tag")?.takeIf { it.isNotBlank() } ?: "$server:$port"
+
+            val profile = ProxyProfile(
+                tag = tag,
+                type = type,
+                server = server,
+                serverPort = port,
+                rawOutbound = outbound.toString(),
+                rawSingBoxRoute = embeddedRoute
+            )
+            val location = LocationConfig(
+                name = tag,
+                engine = EngineType.Standard,
+                proxy = profile,
+                fakeDns = fakeDnsSpec
+            ).normalized()
+            val base = "${server}_$port"
+                .lowercase()
+                .map { if (it.isLetterOrDigit()) it else '_' }
+                .joinToString("")
+            val storageId = uniqueStorageId("imported_$base", usedStorageIds)
+            LocationEntry.from(
+                storageId = storageId,
+                location = location,
+                subscriptionUrl = subscriptionUrl,
+                metadata = null
+            )
+        }
+        if (entries.isEmpty()) return null
+
+        return LocationBundleV4(
+            activeLocationId = entries.firstOrNull()?.storageId,
+            locations = entries
+        )
+    }
+
+    /**
+     * Parses a full raw Xray-core JSON config (single proxy node) into one Standard/Xray location
+     * that runs the config verbatim. Recognised by an "outbounds" array whose entries use Xray's
+     * "protocol" key (vless/vmess/trojan/shadowsocks). server/port/tag are extracted only for the
+     * display name & storage-id; the entire JSON is preserved in [ProxyProfile.rawXrayConfig].
+     */
+    private fun parseRawXray(
+        text: String,
+        subscriptionUrl: String? = null
+    ): LocationBundleV4? {
+        val trimmed = text.trim()
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null
+        val element = runCatching { json.parseToJsonElement(trimmed) }.getOrNull() ?: return null
+
+        // Accept a single Xray config object OR an ARRAY of full Xray configs (Happ/Remnawave-style
+        // subscriptions ship one complete config per server). Each is kept verbatim so its dns.hosts /
+        // routing / fakedns are honored — instead of being downgraded to a bare sing-box vless.
+        val configs: List<JsonObject> = when {
+            element is JsonObject -> listOf(element)
+            else -> runCatching { element.jsonArray }.getOrNull()
+                ?.mapNotNull { it.jsonObjectOrNull() } ?: return null
+        }
+
+        val usedStorageIds = mutableSetOf<String>()
+        val entries = configs.mapNotNull { parseSingleRawXrayEntry(it, usedStorageIds, subscriptionUrl) }
+        if (entries.isEmpty()) return null
+
+        return LocationBundleV4(
+            activeLocationId = entries.firstOrNull()?.storageId,
+            locations = entries
+        )
+    }
+
+    /**
+     * Rewrites a sing-box config's own `route` block into one this app can splice into the config it
+     * builds: every rule's outbound tag is resolved through the config's outbound list and re-pointed at
+     * our own tags ("proxy" / "direct"), a block/reject outbound becomes `action: "reject"`, and rules
+     * that only make sense inside the original config (its `dns` outbound, its inbound tags, the sniff /
+     * hijack-dns plumbing we emit ourselves) are dropped. `rule_set` definitions and `final` come along.
+     *
+     * Returns null when the config ships no usable routing — the app's own routing then applies as before.
+     */
+    private fun normalizeSingBoxRoute(root: JsonObject, outbounds: List<JsonObject>): String? {
+        val route = root["route"]?.jsonObjectOrNull() ?: return null
+        val rules = route["rules"]?.let { runCatching { it.jsonArray }.getOrNull() }
+            ?.mapNotNull { it.jsonObjectOrNull() }
+            ?: return null
+        if (rules.isEmpty()) return null
+
+        // What each outbound tag really is, so a rule pointing at it can be re-pointed at ours.
+        val kindByTag = outbounds.mapNotNull { ob ->
+            val tag = ob.string("tag")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val kind = when (ob.string("type")?.lowercase()) {
+                "direct" -> "direct"
+                "block", "reject" -> "reject"
+                "dns" -> "dns"
+                // A server outbound, or a selector/urltest over servers: all of it is "the tunnel".
+                else -> "proxy"
+            }
+            tag to kind
+        }.toMap()
+
+        val mapped = rules.mapNotNull { rule ->
+            // Rules keyed to the original config's inbounds can never match ours.
+            if (rule["inbound"] != null) return@mapNotNull null
+            val action = rule.string("action")?.lowercase()
+            when (action) {
+                // We emit our own sniff / DNS hijack (and must, for the TUN) — never duplicate them.
+                "sniff", "hijack-dns" -> return@mapNotNull null
+                // reject / resolve / hijack are self-contained: keep verbatim.
+                null, "route" -> Unit
+                else -> return@mapNotNull rule
+            }
+            val target = rule.string("outbound") ?: return@mapNotNull null
+            when (kindByTag[target] ?: "proxy") {
+                "dns" -> null // legacy `outbound: dns-out`; our hijack-dns rule already covers it
+                "reject" -> buildJsonObject {
+                    rule.forEach { (k, v) -> if (k != "outbound" && k != "action") put(k, v) }
+                    put("action", "reject")
+                }
+                "direct" -> buildJsonObject {
+                    rule.forEach { (k, v) -> if (k != "outbound") put(k, v) }
+                    put("outbound", "direct")
+                }
+                else -> buildJsonObject {
+                    rule.forEach { (k, v) -> if (k != "outbound") put(k, v) }
+                    put("outbound", "proxy")
+                }
+            }
+        }
+        if (mapped.isEmpty()) return null
+
+        // Remote rule-sets come along, but their `download_detour` names an outbound of the ORIGINAL
+        // config — pointing at a tag we don't have is a hard sing-box error, so re-point it at ours
+        // (the proxy, which is also what the app uses for its own rule-sets).
+        val ruleSets = route["rule_set"]?.let { runCatching { it.jsonArray }.getOrNull() }
+            ?.mapNotNull { it.jsonObjectOrNull() }
+            ?.map { set ->
+                val detour = set.string("download_detour")
+                if (detour == null && set.string("type") != "remote") {
+                    set
+                } else {
+                    buildJsonObject {
+                        set.forEach { (k, v) -> if (k != "download_detour") put(k, v) }
+                        put("download_detour", if (kindByTag[detour] == "direct") "direct" else "proxy")
+                    }
+                }
+            }
+            .orEmpty()
+        val finalTag = route.string("final")
+            ?.let { if ((kindByTag[it] ?: "proxy") == "direct") "direct" else "proxy" }
+            ?: "proxy"
+
+        return buildJsonObject {
+            put("final", finalTag)
+            put("rules", buildJsonArray { mapped.forEach { add(it) } })
+            if (ruleSets.isNotEmpty()) {
+                put("rule_set", buildJsonArray { ruleSets.forEach { add(it) } })
+            }
+        }.toString()
+    }
+
+    /** Builds one verbatim-Xray location from a single full Xray config object, or null if it isn't one. */
+    private fun parseSingleRawXrayEntry(
+        root: JsonObject,
+        usedStorageIds: MutableSet<String>,
+        subscriptionUrl: String?
+    ): LocationEntry? {
+        val outbounds = runCatching { root["outbounds"]?.jsonArray }.getOrNull()
+            ?.mapNotNull { it.jsonObjectOrNull() } ?: return null
+
+        // The proxy outbound: a known Xray proxy protocol. (Xray keys off "protocol", not "type".)
+        val proxyProtocols = setOf("vless", "vmess", "trojan", "shadowsocks")
+        val proxyOutbound = outbounds.firstOrNull {
+            it.string("protocol")?.lowercase() in proxyProtocols
+        } ?: return null
+
+        val protocol = proxyOutbound.string("protocol")!!.lowercase()
+        val settings = proxyOutbound["settings"]?.jsonObjectOrNull()
+        // vless/vmess use settings.vnext[]; trojan/shadowsocks use settings.servers[].
+        val endpoint = settings?.get("vnext")?.let { runCatching { it.jsonArray }.getOrNull() }
+            ?: settings?.get("servers")?.let { runCatching { it.jsonArray }.getOrNull() }
+        val firstEndpoint = endpoint?.firstOrNull()?.jsonObjectOrNull()
+        val server = firstEndpoint?.string("address") ?: return null
+        val port = firstEndpoint["port"]?.jsonPrimitive?.intOrNull ?: return null
+
+        val name = firstNotBlank(
+            root.string("remarks"),
+            proxyOutbound.string("tag"),
+            "$server:$port"
+        )
+        // Happ-style subscriptions carry a per-server description in `meta.serverDescription` — surface
+        // it as the location's description (display-only). Blank when the source has none.
+        val description = root["meta"]?.jsonObjectOrNull()?.string("serverDescription").orEmpty()
+
+        // Try to fully translate the Xray proxy outbound into typed sing-box-runnable fields PLUS a
+        // FakeDNS spec (fakeip pool + dns.hosts blackholes). When that succeeds, the location runs on
+        // EITHER core — sing-box reproduces FakeDNS natively (dns.fakeip), so FakeDNS no longer needs
+        // xray-core. Only an xhttp/splithttp transport (sing-box can't serve it) keeps the verbatim
+        // Xray template + forced Xray core.
+        // …UNLESS the config carries routing/DNS of its own. That is the whole point of a JSON
+        // subscription: its `routing.rules` and per-domain `dns.servers` express where traffic must go,
+        // and NEITHER survives the typed translation (a typed location gets the APP's routing profile
+        // instead). So whenever the JSON brings its own, keep the template verbatim on Xray —
+        // XrayConfig.prepareRaw then honors it and skips overlaying the app profile.
+        val typed = if (bringsOwnRouting(root)) {
+            null
+        } else {
+            typedProfileFromXrayOutbound(proxyOutbound, protocol, server, port, name)
+        }
+        val location = if (typed != null) {
+            LocationConfig(
+                name = name,
+                description = description,
+                engine = EngineType.Standard,
+                proxy = typed,
+                core = ProxyCore.Auto,
+                fakeDns = fakeDnsSpecFromXray(root),
+            ).normalized()
+        } else {
+            // Untranslatable (xhttp / unknown transport) OR carrying its own routing/DNS → run the whole
+            // template verbatim on Xray.
+            LocationConfig(
+                name = name,
+                description = description,
+                engine = EngineType.Standard,
+                proxy = ProxyProfile(
+                    tag = name,
+                    type = protocol,
+                    server = server,
+                    serverPort = port,
+                    // Keep THIS config (the array element), not the whole array, as the verbatim payload.
+                    rawXrayConfig = root.toString()
+                ),
+                core = ProxyCore.Xray
+            ).normalized()
+        }
+
+        val base = "${server}_$port"
+            .lowercase()
+            .map { if (it.isLetterOrDigit()) it else '_' }
+            .joinToString("")
+        val storageId = uniqueStorageId("imported_$base", usedStorageIds)
+
+        return LocationEntry.from(
+            storageId = storageId,
+            location = location,
+            subscriptionUrl = subscriptionUrl,
+            metadata = null
+        )
+    }
+
+    /**
+     * True when a full Xray config carries routing/DNS of its own: `routing.rules`, or a scoped
+     * `dns.servers` entry (an OBJECT with address + domains, a per-domain resolver split — plain string
+     * servers the typed path reproduces fine). Neither survives the typed translation, so such a config
+     * must run VERBATIM on Xray for its rules to apply.
+     */
+    private fun bringsOwnRouting(root: JsonObject): Boolean {
+        val ownRouting = root["routing"]?.jsonObjectOrNull()
+            ?.get("rules")?.let { runCatching { it.jsonArray }.getOrNull() }
+            ?.isNotEmpty() == true
+        val ownScopedDns = root["dns"]?.jsonObjectOrNull()
+            ?.get("servers")?.let { runCatching { it.jsonArray }.getOrNull() }
+            ?.any { it.jsonObjectOrNull() != null } == true
+        return ownRouting || ownScopedDns
+    }
+
+    /**
+     * Maps an Xray proxy outbound (vless/vmess/trojan/shadowsocks) to a typed [ProxyProfile] that the
+     * sing-box core can dial directly. Returns null when the transport is xhttp/splithttp or otherwise
+     * not serviceable by sing-box (the caller then keeps the verbatim Xray template instead).
+     */
+    private fun typedProfileFromXrayOutbound(
+        outbound: JsonObject,
+        protocol: String,
+        server: String,
+        port: Int,
+        name: String,
+    ): ProxyProfile? {
+        val settings = outbound["settings"]?.jsonObjectOrNull()
+        val stream = outbound["streamSettings"]?.jsonObjectOrNull()
+
+        // Xray network → ProxyProfile network. xhttp/splithttp are Xray-only → bail (verbatim Xray).
+        val xrayNet = stream?.string("network")?.lowercase() ?: "tcp"
+        val network = when (xrayNet) {
+            "tcp", "raw" -> ProxyProfile.NETWORK_TCP
+            "ws", "websocket" -> ProxyProfile.NETWORK_WS
+            "grpc", "gun" -> ProxyProfile.NETWORK_GRPC
+            "h2", "http" -> ProxyProfile.NETWORK_HTTP
+            "httpupgrade" -> ProxyProfile.NETWORK_HTTPUPGRADE
+            "xhttp", "splithttp" -> return null
+            else -> return null
+        }
+
+        val security = when (stream?.string("security")?.lowercase()) {
+            "reality" -> ProxyProfile.SECURITY_REALITY
+            "tls", "xtls" -> ProxyProfile.SECURITY_TLS
+            else -> ProxyProfile.SECURITY_NONE
+        }
+
+        // Per-protocol credentials (vless/vmess use vnext[].users[]; trojan/ss use servers[]).
+        val vnextUser = settings?.get("vnext")?.let { runCatching { it.jsonArray }.getOrNull() }
+            ?.firstOrNull()?.jsonObjectOrNull()
+            ?.get("users")?.let { runCatching { it.jsonArray }.getOrNull() }
+            ?.firstOrNull()?.jsonObjectOrNull()
+        val ssServer = settings?.get("servers")?.let { runCatching { it.jsonArray }.getOrNull() }
+            ?.firstOrNull()?.jsonObjectOrNull()
+
+        // TLS/REALITY parameters live in stream.{realitySettings|tlsSettings}.
+        val tls = stream?.get("realitySettings")?.jsonObjectOrNull()
+            ?: stream?.get("tlsSettings")?.jsonObjectOrNull()
+        val sni = tls?.string("serverName") ?: ""
+        val fingerprint = tls?.string("fingerprint") ?: ""
+        val alpn = (tls?.get("alpn") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            ?: emptyList()
+        val allowInsecure = (tls?.get("allowInsecure") as? JsonPrimitive)?.contentOrNull == "true"
+        val realityPbk = tls?.string("publicKey") ?: ""
+        val realityShortId = tls?.string("shortId") ?: ""
+
+        // Transport-specific path/host/serviceName.
+        val wsLike = stream?.get("wsSettings")?.jsonObjectOrNull()
+            ?: stream?.get("httpupgradeSettings")?.jsonObjectOrNull()
+        val grpc = stream?.get("grpcSettings")?.jsonObjectOrNull()
+        val path = when (network) {
+            ProxyProfile.NETWORK_GRPC -> grpc?.string("serviceName") ?: ""
+            else -> wsLike?.string("path") ?: ""
+        }
+        val host = wsLike?.string("host")
+            ?: (wsLike?.get("headers")?.jsonObjectOrNull()?.string("Host"))
+            ?: ""
+
+        return when (protocol) {
+            "vless", "vmess" -> {
+                val uuid = vnextUser?.string("id") ?: return null
+                if (uuid.isBlank()) return null
+                ProxyProfile(
+                    tag = name,
+                    type = protocol,
+                    server = server,
+                    serverPort = port,
+                    uuid = uuid,
+                    flow = vnextUser.string("flow") ?: "",
+                    alterId = vnextUser.int("alterId") ?: 0,
+                    cipher = vnextUser.string("security") ?: "auto",
+                    network = network,
+                    security = security,
+                    sni = sni,
+                    alpn = alpn,
+                    fingerprint = fingerprint,
+                    allowInsecure = allowInsecure,
+                    realityPublicKey = realityPbk,
+                    realityShortId = realityShortId,
+                    path = path,
+                    host = host,
+                )
+            }
+            "trojan" -> {
+                val pass = ssServer?.string("password") ?: return null
+                ProxyProfile(
+                    tag = name, type = ProxyProfile.TYPE_TROJAN, server = server, serverPort = port,
+                    password = pass, network = network, security = security, sni = sni, alpn = alpn,
+                    fingerprint = fingerprint, allowInsecure = allowInsecure,
+                    realityPublicKey = realityPbk, realityShortId = realityShortId, path = path, host = host,
+                )
+            }
+            "shadowsocks" -> {
+                val pass = ssServer?.string("password") ?: return null
+                ProxyProfile(
+                    tag = name, type = ProxyProfile.TYPE_SHADOWSOCKS, server = server, serverPort = port,
+                    password = pass, method = ssServer.string("method") ?: "",
+                    network = network,
+                )
+            }
+            else -> null
+        }
+    }
+
+    /**
+     * Extracts a [FakeDnsSpec] from a full Xray config: the `fakedns` pool range and the `dns.hosts`
+     * entries that map a domain to `0.0.0.0` (blackhole). Returns null when the config has no fakedns.
+     */
+    private fun fakeDnsSpecFromXray(root: JsonObject): FakeDnsSpec? {
+        val pool = (root["fakedns"] as? JsonArray)?.firstOrNull()?.jsonObjectOrNull()
+        // Xray also accepts a bare object for `fakedns`.
+        val poolObj = pool ?: root["fakedns"]?.jsonObjectOrNull()
+        val hasFakeDns = poolObj != null || (root["fakedns"] != null)
+        if (!hasFakeDns) return null
+
+        val inet4 = poolObj?.string("ipPool")?.takeIf { it.contains('.') } ?: "198.18.0.0/15"
+        val inet6 = poolObj?.string("ipPool")?.takeIf { it.contains(':') } ?: "fc00::/18"
+
+        // dns.hosts: keys mapping to "0.0.0.0" are blackholes. Keys are "regexp:<re>", "domain:<d>",
+        // "geosite:..." or a plain domain. Translate regexp/domain/plain into sing-box domain_regex.
+        val hosts = (root["dns"] as? JsonObject)?.get("hosts") as? JsonObject
+        val blockRegex = hosts?.mapNotNull { (key, value) ->
+            val blocks = when (value) {
+                is JsonPrimitive -> value.contentOrNull == "0.0.0.0"
+                is JsonArray -> value.any { (it as? JsonPrimitive)?.contentOrNull == "0.0.0.0" }
+                else -> false
+            }
+            if (!blocks) return@mapNotNull null
+            when {
+                key.startsWith("regexp:") -> key.removePrefix("regexp:")
+                key.startsWith("domain:") -> {
+                    val d = key.removePrefix("domain:").replace(".", "\\.")
+                    "(^|\\.)$d$"
+                }
+                key.startsWith("geosite:") || key.startsWith("geoip:") -> null // not regex-translatable
+                else -> {
+                    val d = key.replace(".", "\\.")
+                    "(^|\\.)$d$"
+                }
+            }
+        }.orEmpty().filterNotNull()
+
+        return FakeDnsSpec(inet4Range = inet4, inet6Range = inet6, blockRegex = blockRegex)
+    }
+
+    /**
+     * Extracts a [FakeDnsSpec] from a full sing-box config. Two shapes are accepted: the legacy
+     * `dns.fakeip` block and the 1.12+ `dns.servers[]` entry of `type: "fakeip"`. Returns null when
+     * the config has no fakeip (or has it disabled).
+     *
+     * Only the pools travel: the blackhole list is [FakeDnsSpec.blockRegex]'s job on the Xray side,
+     * and a sing-box config expresses the same thing as `route` rules — which already come along
+     * verbatim via [normalizeSingBoxRoute], so translating its `dns.rules` too would double them.
+     */
+    private fun fakeDnsSpecFromSingBox(root: JsonObject): FakeDnsSpec? {
+        val dns = root["dns"]?.jsonObjectOrNull() ?: return null
+        val legacy = dns["fakeip"]?.jsonObjectOrNull()
+        val server = (dns["servers"] as? JsonArray)
+            ?.mapNotNull { it.jsonObjectOrNull() }
+            ?.firstOrNull { it.string("type")?.lowercase() == "fakeip" }
+        val block = legacy ?: server ?: return null
+        // `enabled` only exists on the legacy block; a 1.12+ fakeip server is on by its presence.
+        if (block["enabled"]?.jsonPrimitive?.booleanOrNull == false) return null
+        val defaults = FakeDnsSpec()
+        return FakeDnsSpec(
+            inet4Range = block.string("inet4_range")?.takeIf { it.isNotBlank() } ?: defaults.inet4Range,
+            inet6Range = block.string("inet6_range")?.takeIf { it.isNotBlank() } ?: defaults.inet6Range,
+        )
+    }
+
+    private fun parseOlcRtcUri(line: String): ParsedOlcRtcUri? {
+        val payload = line.removePrefix(OLCRTC_URI_PREFIX)
+
+        val transportMarker = payload.indexOf('?')
+        val roomMarker = payload.indexOf('@', startIndex = transportMarker + 1)
+        val keyMarker = payload.indexOf('#', startIndex = roomMarker + 1)
+
+        if (transportMarker <= 0 || roomMarker <= transportMarker || keyMarker <= roomMarker) {
+            return null
+        }
+
+        val clientMarker = payload
+            .indexOf('%', startIndex = keyMarker + 1)
+            .takeIf { it >= 0 }
+
+        val mimoMarker = payload
+            .indexOf('$', startIndex = keyMarker + 1)
+            .takeIf { it >= 0 }
+
+        val keyEnd = listOfNotNull(clientMarker, mimoMarker).minOrNull() ?: payload.length
+
+        val provider = payload.substring(0, transportMarker).trim()
+        val transportToken = payload.substring(transportMarker + 1, roomMarker).trim()
+        val (transport, transportOptions) = parseTransportToken(transportToken)
+        val roomId = payload.substring(roomMarker + 1, keyMarker).trim()
+        val key = payload.substring(keyMarker + 1, keyEnd).trim()
+
+        val mimo = mimoMarker
+            ?.let { payload.substring(it + 1) }
+            .orEmpty()
+            .trim()
+
+        val location = LocationConfig(
+            name = mimo.ifBlank { roomId },
+            id = roomId,
+            key = key,
+            bypassProvider = provider,
+            transport = transport,
+            vp8Fps = (transportOptions["vp8-fps"] ?: transportOptions["fps"])?.toIntOrNull()
+                ?: LocationConfig.DEFAULT_VP8_FPS,
+            vp8Batch = (transportOptions["vp8-batch"] ?: transportOptions["batch"])?.toIntOrNull()
+                ?: LocationConfig.DEFAULT_VP8_BATCH,
+            // seichannel/videochannel parameters (frag, ack-ms, video-codec, …) reach the core from here.
+            transportOptions = transportOptions
+        ).normalized()
+
+        return location
+            .takeIf { it.isComplete() }
+            ?.let { ParsedOlcRtcUri(it, mimo.takeIf { value -> value.isNotBlank() }) }
+    }
+
+    private fun buildSubscriptionMetadata(fields: Map<String, String>): SubscriptionMetadata? {
+        return SubscriptionMetadata(
+            name = fields["name"],
+            update = fields["update"],
+            refresh = fields["refresh"],
+            color = fields["color"],
+            icon = fields["icon"],
+            used = fields["used"],
+            available = fields["available"]
+        ).normalized().takeUnless { it.isEmpty() }
+    }
+
+    private fun buildLocationMetadata(
+        fields: Map<String, String>,
+        mimo: String?,
+        subscription: SubscriptionMetadata?
+    ): LocationMetadata? {
+        return LocationMetadata(
+            name = fields["name"],
+            color = fields["color"],
+            icon = fields["icon"],
+            used = fields["used"],
+            available = fields["available"],
+            ip = fields["ip"],
+            comment = fields["comment"],
+            mimo = mimo,
+            subscription = subscription
+        ).normalized().takeUnless { it.isEmpty() }
+    }
+
+    /**
+     * `<Transport><key=value&…>` → the transport and its parameters. Values stay strings: videochannel
+     * takes words too (`video-codec=tile`, `video-qr-recovery=high`).
+     */
+    private fun parseTransportToken(token: String): Pair<String, Map<String, String>> {
+        val optionsStart = token.indexOf('<')
+        val optionsEnd = token.lastIndexOf('>')
+        if (optionsStart < 0 || optionsEnd <= optionsStart) {
+            return token to emptyMap()
+        }
+
+        val transport = token.substring(0, optionsStart).trim()
+        val options = token.substring(optionsStart + 1, optionsEnd)
+            .split('&')
+            .mapNotNull { part ->
+                val separator = part.indexOf('=')
+                if (separator <= 0) return@mapNotNull null
+                val key = part.substring(0, separator).trim().lowercase()
+                val value = part.substring(separator + 1).trim().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                key to value
+            }
+            .toMap()
+
+        return transport to options
+    }
+
+    /**
+     * `#refresh:` of an olcRTC subscription ("5s", "10m", "6h", "1d"; a bare number = seconds) → whole
+     * hours for the auto-updater, which runs no more often than hourly. Null when absent or unreadable.
+     */
+    private fun refreshIntervalHours(value: String?): Int? {
+        val match = Regex("""^\s*(\d+)\s*([smhd]?)\s*$""", RegexOption.IGNORE_CASE).find(value ?: return null)
+            ?: return null
+        val amount = match.groupValues[1].toLongOrNull() ?: return null
+        val seconds = when (match.groupValues[2].lowercase()) {
+            "m" -> amount * 60
+            "h" -> amount * 3600
+            "d" -> amount * 86_400
+            else -> amount
+        }
+        if (seconds <= 0) return null
+        return ((seconds + 3599) / 3600).coerceIn(
+            SubscriptionMetadata.MIN_UPDATE_INTERVAL_HOURS.toLong(),
+            SubscriptionMetadata.MAX_UPDATE_INTERVAL_HOURS.toLong()
+        ).toInt()
+    }
+
+    private fun parseSubscriptionField(value: String): Pair<String, String>? {
+        val separator = value.indexOf(':')
+        if (separator <= 0) return null
+
+        val key = value.substring(0, separator).trim().lowercase()
+        val fieldValue = value.substring(separator + 1).trim()
+
+        return key to fieldValue
+    }
+
+    private fun uniqueStorageId(base: String, used: MutableSet<String>): String {
+        val normalizedBase = base.storageSlug()
+        var candidate = normalizedBase
+        var suffix = 2
+
+        while (!used.add(candidate)) {
+            candidate = "${normalizedBase}_$suffix"
+            suffix += 1
+        }
+
+        return candidate
+    }
+
+    private fun decodeLocationEntry(root: JsonObject, subscriptionUrl: String? = null): LocationEntry? {
+        return runCatching {
+            json.decodeFromJsonElement(LocationEntry.serializer(), root)
+                .let { entry ->
+                    if (entry.subscriptionUrl.isNullOrBlank() && !subscriptionUrl.isNullOrBlank()) {
+                        entry.copy(subscriptionUrl = subscriptionUrl)
+                    } else {
+                        entry
+                    }
+                }
+                .normalized()
+                .takeIf { it.location.isStorable() }
+        }.getOrNull()
+    }
+
+    /**
+     * What identifies a subscription server across refreshes. The olcRTC fields alone left every proxy
+     * location with the SAME signature (they're all blank there), so refreshes matched servers purely
+     * by position — the endpoint tells proxy servers apart.
+     */
+    private fun subscriptionSignature(location: LocationConfig): String {
+        val normalized = location.normalized()
+        return listOf(
+            normalized.bypassProvider,
+            normalized.transport,
+            normalized.id,
+            normalized.key,
+            normalized.proxy?.let { "${it.type}@${it.server}:${it.serverPort}" }.orEmpty(),
+            // The freeturn:// link minus its `$comment` (the display name): a rename upstream must still
+            // match by endpoint in the fallback pass below.
+            normalized.vkturn?.let { "${it.outbound}@${it.uri.substringBefore('$').ifBlank { it.outboundProxyLink }}" }.orEmpty(),
+            normalized.masterDns?.let { "${it.domains}@${it.resolvers}" }.orEmpty(),
+            normalized.openFlux?.let { "${it.transport}@${if (it.usesMax()) it.maxUid else it.docUrl}" }.orEmpty(),
+            normalized.snolc?.let { "snolc@${it.host}:${it.port}" }.orEmpty(),
+        ).joinToString("|")
+    }
+
+    /** [subscriptionSignature] + name: several servers of one panel often share one endpoint. */
+    private fun namedSubscriptionSignature(location: LocationConfig): String =
+        subscriptionSignature(location) + "|" + location.name.trim()
+
+    private fun LocationConfig.storageSlug(): String {
+        return displayName().ifBlank { id }.storageSlug()
+    }
+
+    private fun String.storageSlug(): String {
+        return lowercase()
+            .replace(Regex("[^a-z0-9_-]+"), "_")
+            .trim('_')
+            .take(32)
+            .ifBlank { "location" }
+    }
+
+    private fun JsonObject.string(name: String): String? {
+        return (this[name] as? JsonPrimitive)?.contentOrNull
+    }
+
+    private fun JsonObject.int(name: String): Int? {
+        return (this[name] as? JsonPrimitive)?.intOrNull
+    }
+
+    private fun JsonElement.jsonObjectOrNull(): JsonObject? {
+        return runCatching { jsonObject }.getOrNull()
+    }
+
+    private fun firstNotBlank(vararg values: String?): String {
+        return values.firstOrNull { !it.isNullOrBlank() } ?: ""
+    }
+
+    private fun firstInt(vararg values: Int?): Int? {
+        return values.firstOrNull { it != null }
+    }
+
+    private fun transportArgInt(args: String, name: String): Int? {
+        if (args.isBlank()) return null
+
+        val parts = args.split(Regex("\\s+")).filter { it.isNotBlank() }
+        val index = parts.indexOf(name)
+
+        return parts.getOrNull(index + 1)?.toIntOrNull()
+    }
+
+    private fun HttpResponse.profileUpdateIntervalHours(): Int? {
+        return headers["profile-update-interval"]
+            ?.trim()
+            ?.toIntOrNull()
+            ?.coerceIn(
+                SubscriptionMetadata.MIN_UPDATE_INTERVAL_HOURS,
+                SubscriptionMetadata.MAX_UPDATE_INTERVAL_HOURS
+            )
+    }
+
+    private fun List<LocationEntry>.subscriptionUpdateIntervalHours(): Int? {
+        return firstNotNullOfOrNull { entry ->
+            entry.metadata?.subscription?.updateIntervalHours
+        }
+    }
+
+    /** Auto-update is considered disabled for the group if ANY of its entries has it turned off. */
+    private fun List<LocationEntry>.subscriptionAutoUpdateEnabled(): Boolean {
+        return none { entry -> entry.metadata?.subscription?.autoUpdateEnabled == false }
+    }
+
+    private fun SubscriptionMetadata?.withSubscriptionInterval(hours: Int?): SubscriptionMetadata? {
+        if (hours == null) return this
+        return (this ?: SubscriptionMetadata()).copy(
+            updateIntervalHours = hours
+        ).normalized()
+    }
+
+    private fun LocationMetadata?.withSubscriptionInterval(hours: Int?): LocationMetadata? {
+        if (hours == null) return this
+        return withSubscriptionRefreshState(
+            updateIntervalHours = hours,
+            lastRefreshAtEpochMs = this?.subscription?.lastRefreshAtEpochMs,
+            lastAttemptAtEpochMs = this?.subscription?.lastAttemptAtEpochMs,
+            autoUpdateEnabled = this?.subscription?.autoUpdateEnabled ?: true
+        )
+    }
+
+    /** Flips the per-subscription auto-update switch, keeping the rest of the metadata intact. */
+    private fun LocationMetadata?.withSubscriptionAutoUpdate(enabled: Boolean): LocationMetadata {
+        val subscription = this?.subscription ?: SubscriptionMetadata()
+        return (this ?: LocationMetadata()).copy(
+            subscription = subscription.copy(autoUpdateEnabled = enabled)
+        ).normalized()
+    }
+
+    private fun LocationMetadata?.withSubscriptionRefreshState(
+        updateIntervalHours: Int,
+        lastRefreshAtEpochMs: Long?,
+        lastAttemptAtEpochMs: Long? = lastRefreshAtEpochMs,
+        autoUpdateEnabled: Boolean = this?.subscription?.autoUpdateEnabled ?: true
+    ): LocationMetadata {
+        val subscription = this?.subscription ?: SubscriptionMetadata()
+        return (this ?: LocationMetadata()).copy(
+            subscription = subscription.copy(
+                updateIntervalHours = updateIntervalHours,
+                lastRefreshAtEpochMs = lastRefreshAtEpochMs,
+                lastAttemptAtEpochMs = lastAttemptAtEpochMs,
+                autoUpdateEnabled = autoUpdateEnabled
+            )
+        ).normalized()
+    }
+
+    /** Records only a refresh ATTEMPT time (failure path), keeping the existing links/metadata intact. */
+    private fun LocationMetadata?.withSubscriptionAttemptState(lastAttemptAtEpochMs: Long): LocationMetadata {
+        val subscription = this?.subscription ?: SubscriptionMetadata()
+        return (this ?: LocationMetadata()).copy(
+            subscription = subscription.copy(lastAttemptAtEpochMs = lastAttemptAtEpochMs)
+        ).normalized()
+    }
+
+    private companion object {
+        const val OLCRTC_URI_PREFIX = "olcrtc://"
+        const val UTF8_BOM = "\uFEFF"
+        /** Happ provider-tracking check endpoint; the provider id is appended as the `id` query param. */
+        const val PROVIDER_CHECK_URL = "https://check.happ-proxy.com/provider?id="
+
+        /**
+         * Unique app-install identifier header (a.k.a. goiID). Sent alongside `x-hwid` so the panel owner
+         * can register/track OUR app in Remnawave and target announcements. Change this single constant
+         * if the panel expects a different header name.
+         */
+        const val HEADER_APP_ID = "x-app-id"
+    }
+}

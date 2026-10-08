@@ -1,0 +1,688 @@
+// Package awg is a gomobile-friendly AmneziaWG client: it brings up an amneziawg-go device on a
+// userspace gVisor netstack and exposes a local SOCKS5 proxy backed by that tunnel. The olcvpn
+// client points a sing-box socks outbound at it, so AmneziaWG works as a normal outbound and as a
+// chain hop without touching sing-box's (vanilla) WireGuard engine.
+//
+// The package is named `awg` (not `mobile`) so gomobile's generated Java class is awg.Awg and does
+// not collide with the other bound packages (olcrtc's mobile.Mobile, freeturn.Freeturn).
+package awg
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/netip"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
+)
+
+// LogWriter receives log lines; implemented on the Kotlin side.
+type LogWriter interface{ WriteLog(line string) }
+
+type logBridge struct{ w LogWriter }
+
+func (b logBridge) Write(p []byte) (int, error) { b.w.WriteLog(string(p)); return len(p), nil }
+
+//nolint:gochecknoglobals // package singleton mirrors freeturn/olcrtc.
+var (
+	mu       sync.Mutex
+	running  atomic.Bool
+	dev      *device.Device
+	listener net.Listener
+	logSink  io.Writer = io.Discard
+	debug    atomic.Bool
+	// statsStop закрывается в Stop и глушит репортёр счётчиков (см. reportTransfer).
+	statsStop chan struct{}
+)
+
+// Как часто докладывать rx/tx туннеля. Раз в 10 секунд: этого хватает, чтобы отличить "трафик до нас
+// не доходит" от "мы шлём, а ответа нет", и мало, чтобы не засорять журнал.
+const transferReportInterval = 10 * time.Second
+
+// Protector protects a socket fd from the VPN (implemented in Kotlin via VpnService.protect). It
+// mirrors xraybridge.Protector so the AmneziaWG probe/measure sockets bypass the active system TUN
+// — otherwise, while connected, the throwaway WG handshake would ride the tunnel and report a
+// bogus (tunnel-inflated) latency instead of the real path to the endpoint.
+type Protector interface {
+	Protect(fd int) bool
+}
+
+//nolint:gochecknoglobals // process-wide, mirrors the other bound packages.
+var (
+	protectorMu sync.Mutex
+	protector   Protector
+)
+
+// SetProtector installs the socket protector used by Probe/MeasureDelay (and Start). Passing nil
+// clears it. Must be set before those calls for protection to take effect.
+func SetProtector(p Protector) {
+	protectorMu.Lock()
+	protector = p
+	protectorMu.Unlock()
+}
+
+// protectBind protects the UDP socket(s) the WireGuard bind has just opened (after device Up), so
+// outbound WG packets leave via the underlying network rather than the system VPN tun. No-op when
+// no protector is set or the bind doesn't expose its fd (non-Android builds).
+func protectBind(bind conn.Bind) {
+	protectorMu.Lock()
+	p := protector
+	protectorMu.Unlock()
+	if p == nil {
+		return
+	}
+	type fdPeeker interface {
+		PeekLookAtSocketFd4() (int, error)
+		PeekLookAtSocketFd6() (int, error)
+	}
+	b, ok := bind.(fdPeeker)
+	if !ok {
+		return
+	}
+	if fd, err := b.PeekLookAtSocketFd4(); err == nil && fd >= 0 {
+		p.Protect(fd)
+	}
+	if fd, err := b.PeekLookAtSocketFd6(); err == nil && fd >= 0 {
+		p.Protect(fd)
+	}
+}
+
+// SetLogWriter routes logs to w (nil → discard).
+func SetLogWriter(w LogWriter) {
+	if w == nil {
+		logSink = io.Discard
+		return
+	}
+	logSink = logBridge{w: w}
+}
+
+// awgVersion is the amneziawg-go tag vendored at olcvpn-client/amneziawg-go. Bump it on every
+// re-vendor — the settings screen shows it and it's the only way to tell which AWG is inside.
+const awgVersion = "3.1.20260828"
+
+// Version reports the vendored AmneziaWG core version (shown in the app's settings).
+func Version() string { return awgVersion }
+
+// SetDebug toggles verbose device logging.
+func SetDebug(enabled bool) { debug.Store(enabled) }
+
+// IsRunning reports whether an AmneziaWG SOCKS proxy is active.
+func IsRunning() bool { return running.Load() }
+
+// Start brings up the AmneziaWG tunnel from a wg-quick-style INI config (which also carries the
+// Amnezia obfuscation params Jc/Jmin/Jmax/S1/S2/H1..H4) and raises a SOCKS5 proxy on listenAddr
+// (e.g. 127.0.0.1:10810). Returns an error for invalid config or if the listener can't bind.
+func Start(iniConfig, listenAddr string) error {
+	mu.Lock()
+	defer mu.Unlock()
+	if running.Load() {
+		return errors.New("awg already running")
+	}
+
+	cfg, err := parseConfig(iniConfig)
+	if err != nil {
+		return fmt.Errorf("awg config: %w", err)
+	}
+	uapi, err := cfg.uapi()
+	if err != nil {
+		return fmt.Errorf("awg uapi: %w", err)
+	}
+
+	tunDev, tnet, err := netstack.CreateNetTUN(cfg.addresses, cfg.dns, cfg.mtu)
+	if err != nil {
+		return fmt.Errorf("awg netstack: %w", err)
+	}
+
+	level := device.LogLevelError
+	if debug.Load() {
+		level = device.LogLevelVerbose
+	}
+	logger := device.NewLogger(level, "[awg] ")
+	logger.Verbosef = func(format string, args ...any) { log.New(logSink, "", 0).Printf(format, args...) }
+	logger.Errorf = func(format string, args ...any) { log.New(logSink, "", 0).Printf(format, args...) }
+
+	bind := bindFor(cfg)
+	d := device.NewDevice(tunDev, bind, logger)
+	if err := ipcSetTolerant(d, uapi); err != nil {
+		d.Close()
+		return fmt.Errorf("awg ipc: %w", err)
+	}
+	if err := d.Up(); err != nil {
+		d.Close()
+		return fmt.Errorf("awg up: %w", err)
+	}
+	protectBind(bind)
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		d.Close()
+		return fmt.Errorf("awg socks listen %s: %w", listenAddr, err)
+	}
+
+	dev = d
+	listener = ln
+	running.Store(true)
+	statsStop = make(chan struct{})
+	go serveSocks(ln, tnet)
+	go reportTransfer(d, statsStop)
+	log.New(logSink, "", 0).Printf("AmneziaWG SOCKS up on %s (params: %s)", listenAddr, cfg.paramSummary())
+	return nil
+}
+
+// reportTransfer периодически вытаскивает из устройства счётчики пира и пишет их в лог.
+//
+// Без них "туннель не работает" неразличимо: handshake прошёл, дальше в журнале тишина - и непонятно,
+// то ли до AmneziaWG вообще не доходит трафик (тогда виноват тот, кто дальше по цепочке), то ли мы
+// шлём, а сервер молчит (тогда расходятся параметры обфускации или ключи). rx/tx отвечают на это
+// сразу. Пишем только при изменении, чтобы простаивающий туннель не капал в журнал.
+func reportTransfer(d *device.Device, stop <-chan struct{}) {
+	ticker := time.NewTicker(transferReportInterval)
+	defer ticker.Stop()
+	var lastRx, lastTx int64
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			rx, tx, handshake := peerCounters(d)
+			if rx == lastRx && tx == lastTx {
+				continue
+			}
+			lastRx, lastTx = rx, tx
+			since := "никогда"
+			if handshake > 0 {
+				since = fmt.Sprintf("%.0fс назад", time.Since(time.Unix(handshake, 0)).Seconds())
+			}
+			log.New(logSink, "", 0).Printf("transfer: rx=%d B tx=%d B, handshake %s", rx, tx, since)
+		}
+	}
+}
+
+// peerCounters читает rx/tx и время последнего handshake из UAPI-дампа устройства.
+func peerCounters(d *device.Device) (rx, tx, handshake int64) {
+	var buf strings.Builder
+	if err := d.IpcGetOperation(&buf); err != nil {
+		return 0, 0, 0
+	}
+	for _, line := range strings.Split(buf.String(), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			continue
+		}
+		switch key {
+		case "rx_bytes":
+			rx += n
+		case "tx_bytes":
+			tx += n
+		case "last_handshake_time_sec":
+			if n > handshake {
+				handshake = n
+			}
+		}
+	}
+	return rx, tx, handshake
+}
+
+// Probe measures round-trip latency to the AmneziaWG server WITHOUT a full connection: it brings
+// up a throwaway device on a private netstack, forces the WG handshake by dialing a reachable host
+// through the tunnel, returns the elapsed ms, and tears everything down. Returns -1 on failure
+// (unreachable/blocked/bad config). Safe to call while a real session runs (own socket/device).
+func Probe(iniConfig string) int64 {
+	cfg, err := parseConfig(iniConfig)
+	if err != nil {
+		return -1
+	}
+	uapi, err := cfg.uapi()
+	if err != nil {
+		return -1
+	}
+	tunDev, tnet, err := netstack.CreateNetTUN(cfg.addresses, cfg.dns, cfg.mtu)
+	if err != nil {
+		return -1
+	}
+	bind := bindFor(cfg)
+	d := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelError, "[awg-probe] "))
+	defer d.Close()
+	if err := ipcSetTolerant(d, uapi); err != nil {
+		return -1
+	}
+	if err := d.Up(); err != nil {
+		return -1
+	}
+	protectBind(bind)
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	c, err := tnet.DialContext(ctx, "tcp", "1.1.1.1:443")
+	if err != nil {
+		return -1
+	}
+	_ = c.Close()
+	return time.Since(start).Milliseconds()
+}
+
+// MeasureDelay brings up a THROWAWAY AmneziaWG tunnel from [iniConfig], fetches [url] (HTTP
+// [method] "GET"/"HEAD") THROUGH it, and returns the round-trip in milliseconds (-1 on failure).
+// Mirrors xraybridge.MeasureDelay for the AWG outbound: needs no system VPN/TUN and is independent
+// of any running session, so AmneziaWG servers can be URL-tested from the list while disconnected.
+func MeasureDelay(iniConfig, url, method string, timeoutMs int) int64 {
+	cfg, err := parseConfig(iniConfig)
+	if err != nil {
+		return -1
+	}
+	uapi, err := cfg.uapi()
+	if err != nil {
+		return -1
+	}
+	tunDev, tnet, err := netstack.CreateNetTUN(cfg.addresses, cfg.dns, cfg.mtu)
+	if err != nil {
+		return -1
+	}
+	bind := bindFor(cfg)
+	d := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelError, "[awg-urltest] "))
+	defer d.Close()
+	if err := ipcSetTolerant(d, uapi); err != nil {
+		return -1
+	}
+	if err := d.Up(); err != nil {
+		return -1
+	}
+	protectBind(bind)
+
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			// Every connection (incl. DNS) rides the AmneziaWG netstack tunnel.
+			DialContext: tnet.DialContext,
+		},
+	}
+	if method == "" {
+		method = "HEAD"
+	}
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		return -1
+	}
+	req.Header.Set("User-Agent", "olcbox-ping")
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return -1
+	}
+	_ = resp.Body.Close()
+	return time.Since(start).Milliseconds()
+}
+
+// Stop tears down the SOCKS listener and the AmneziaWG device.
+func Stop() {
+	mu.Lock()
+	defer mu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+		listener = nil
+	}
+	if statsStop != nil {
+		close(statsStop)
+		statsStop = nil
+	}
+	if dev != nil {
+		dev.Close()
+		dev = nil
+	}
+	running.Store(false)
+}
+
+// --- config ---
+
+type wgConfig struct {
+	privateKeyHex string
+	peerPublicHex string
+	presharedHex  string
+	endpoint      string
+	allowedIPs    []string
+	keepalive     int
+	addresses     []netip.Addr
+	dns           []netip.Addr
+	mtu           int
+	// Amnezia obfuscation knobs (jc/jmin/jmax/s1..s4/h1..h4/i1..i5/j1..j3/itime), preserved in
+	// input order with their raw values (e.g. i-packets are "<b 0x...>").
+	awgParams [][2]string
+	// Cloudflare WARP "reserved" header bytes (the registration client_id). WARP REQUIRES every
+	// outgoing WireGuard message to carry these 3 bytes in the otherwise-reserved header field
+	// (bytes 1..3); amneziawg-go leaves them zero, so Cloudflare silently drops all data. Stamped
+	// on Send by reservedBind. Zero/absent (hasReserved=false) for normal AmneziaWG servers.
+	reserved    [3]byte
+	hasReserved bool
+}
+
+// awgKnobs сопоставляет ключ из .conf с ключом UAPI устройства. Значение "" = имя совпадает.
+//
+// ВАЖНО: список обязан соответствовать тому, что принимает вендоренный amneziawg-go (device/uapi.go).
+// До обновления ядра на v3 устройство не знало S3/S4 и параметров AmneziaWG 2.0, и они здесь
+// намеренно отбрасывались. Теперь принимает — а отбрасывать их СМЕРТЕЛЬНО: S4 - это набивка
+// ТРАНСПОРТНЫХ пакетов, header protection шифрует их заголовок. Если сервер настроен с ними, а
+// клиент молча их потерял, рукопожатие (S1/S2/H1/H2 совпадают) проходит, а каждый пакет данных
+// летит в мусор в обе стороны: туннель «поднят», трафика нет, каждые 15 секунд новый handshake.
+// Ровно это и было видно в логе пользователя 30.08 (rx рос только на 92 байта ответа handshake).
+var awgKnobs = map[string]string{
+	"jc": "", "jmin": "", "jmax": "",
+	"s1": "", "s2": "", "s3": "", "s4": "",
+	"h1": "", "h2": "", "h3": "", "h4": "",
+	"i1": "", "i2": "", "i3": "", "i4": "", "i5": "",
+	"j1": "", "j2": "", "j3": "", "itime": "",
+	// AmneziaWG 2.0: имена в .conf и в UAPI различаются.
+	"contentpaddingaddition": "content_padding_addition",
+	"rekeyaftertime":         "rekey_after_time",
+	"rekeytimeout":           "rekey_timeout",
+	"rejectaftertime":        "reject_after_time",
+	"keepalivetimeout":       "keepalive_timeout",
+	"maxhandshakeattempts":   "max_handshake_attempts",
+	"randomtrailers":         "random_trailers",
+	"disablecookies":         "disable_cookies",
+}
+
+// awgBoolKnobs — UAPI keys the device parses with strconv.ParseBool. AmneziaVPN writes them as
+// "on"/"off" in .conf (RandomTrailers = on), which ParseBool rejects and the whole IpcSet fails.
+var awgBoolKnobs = map[string]bool{"random_trailers": true, "disable_cookies": true}
+
+func uapiBool(v string) string {
+	switch strings.ToLower(v) {
+	case "on", "yes", "y", "1", "true", "enable", "enabled":
+		return "true"
+	case "off", "no", "n", "0", "false", "disable", "disabled":
+		return "false"
+	}
+	return v
+}
+
+func parseConfig(ini string) (*wgConfig, error) {
+	c := &wgConfig{mtu: 1280, keepalive: 25}
+	for _, raw := range strings.Split(ini, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "[") || strings.HasPrefix(line, "#") {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(line[:eq]))
+		val := strings.TrimSpace(line[eq+1:])
+		switch key {
+		case "privatekey":
+			h, err := keyToHex(val)
+			if err != nil {
+				return nil, fmt.Errorf("privatekey: %w", err)
+			}
+			c.privateKeyHex = h
+		case "publickey":
+			h, err := keyToHex(val)
+			if err != nil {
+				return nil, fmt.Errorf("publickey: %w", err)
+			}
+			c.peerPublicHex = h
+		case "presharedkey":
+			// Its absence doesn't show up until the handshake: the PSK is mixed into the response
+			// keys, so without it the client can't open the server's reply — "connected", no handshake.
+			// Every AmneziaVPN config carries a PSK; WARP ones don't, which is why only they worked.
+			h, err := keyToHex(val)
+			if err != nil {
+				return nil, fmt.Errorf("presharedkey: %w", err)
+			}
+			c.presharedHex = h
+		case "endpoint":
+			c.endpoint = val
+		case "allowedips":
+			for _, p := range strings.Split(val, ",") {
+				if p = strings.TrimSpace(p); p != "" {
+					c.allowedIPs = append(c.allowedIPs, p)
+				}
+			}
+		case "persistentkeepalive":
+			c.keepalive, _ = strconv.Atoi(val)
+		case "address":
+			for _, p := range strings.Split(val, ",") {
+				if a, err := netip.ParsePrefix(strings.TrimSpace(p)); err == nil {
+					c.addresses = append(c.addresses, a.Addr())
+				} else if a, err := netip.ParseAddr(strings.TrimSpace(p)); err == nil {
+					c.addresses = append(c.addresses, a)
+				}
+			}
+		case "dns":
+			for _, p := range strings.Split(val, ",") {
+				if a, err := netip.ParseAddr(strings.TrimSpace(p)); err == nil {
+					c.dns = append(c.dns, a)
+				}
+			}
+		case "mtu":
+			if m, err := strconv.Atoi(val); err == nil && m > 0 {
+				c.mtu = m
+			}
+		case "reserved":
+			// "b0, b1, b2" — three decimal bytes (Cloudflare WARP client_id). Anything else is ignored.
+			parts := strings.Split(val, ",")
+			if len(parts) == 3 {
+				ok := true
+				var r [3]byte
+				for i, p := range parts {
+					n, err := strconv.Atoi(strings.TrimSpace(p))
+					if err != nil || n < 0 || n > 255 {
+						ok = false
+						break
+					}
+					r[i] = byte(n)
+				}
+				if ok && r != ([3]byte{}) {
+					c.reserved = r
+					c.hasReserved = true
+				}
+			}
+		case "headerprotectionkey":
+			// Ключ защиты заголовков в .conf лежит в base64, как и обычные ключи WireGuard,
+			// а UAPI ждёт hex.
+			h, err := keyToHex(val)
+			if err != nil {
+				return nil, fmt.Errorf("headerprotectionkey: %w", err)
+			}
+			c.awgParams = append(c.awgParams, [2]string{"header_protection_key", h})
+		default:
+			if uapiKey, ok := awgKnobs[key]; ok && val != "" {
+				if uapiKey == "" {
+					uapiKey = key
+				}
+				if awgBoolKnobs[uapiKey] {
+					val = uapiBool(val)
+				}
+				c.awgParams = append(c.awgParams, [2]string{uapiKey, val})
+			}
+		}
+	}
+	if c.privateKeyHex == "" || c.peerPublicHex == "" || c.endpoint == "" {
+		return nil, errors.New("missing PrivateKey/PublicKey/Endpoint")
+	}
+	if len(c.addresses) == 0 {
+		return nil, errors.New("missing Address")
+	}
+	// In client mode / SOCKS proxy mode, all internet traffic routes through this single peer.
+	// Always force allowedIPs to 0.0.0.0/0 and ::/0 so amneziawg cryptokey routing
+	// never drops packets to or from internet destinations (e.g. if the imported config
+	// contained a restricted server-side internal subnet like 10.7.1.0/24 or only IPv4).
+	c.allowedIPs = []string{"0.0.0.0/0", "::/0"}
+	if len(c.dns) == 0 {
+		c.dns = []netip.Addr{netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("8.8.8.8")}
+	}
+	return c, nil
+}
+
+// uapi renders the device IPC config (amneziawg-go accepts hex keys + the awg obfuscation knobs).
+func (c *wgConfig) uapi() (string, error) {
+	ep, err := resolveEndpoint(c.endpoint)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "private_key=%s\n", c.privateKeyHex)
+	// Amnezia params must precede the peer to take effect for the handshake; emit in input order
+	// with raw values (i-packets are "<b 0x...>" tokens the device parses itself).
+	for _, kv := range c.awgParams {
+		fmt.Fprintf(&b, "%s=%s\n", kv[0], kv[1])
+	}
+	// Повтор в [ipcSetTolerant] переотправляет конфиг целиком, поэтому секция пира должна быть
+	// идемпотентной: без replace_peers каждая попытка добавляла бы пиру ещё один allowed_ip.
+	b.WriteString("replace_peers=true\n")
+	fmt.Fprintf(&b, "public_key=%s\n", c.peerPublicHex)
+	if c.presharedHex != "" {
+		fmt.Fprintf(&b, "preshared_key=%s\n", c.presharedHex)
+	}
+	fmt.Fprintf(&b, "endpoint=%s\n", ep)
+	for _, a := range c.allowedIPs {
+		fmt.Fprintf(&b, "allowed_ip=%s\n", a)
+	}
+	if c.keepalive > 0 {
+		fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", c.keepalive)
+	}
+	return b.String(), nil
+}
+
+// ipcSetTolerant загружает конфиг в устройство, ВЫБРАСЫВАЯ обфускационные ключи, которых
+// вендоренный amneziawg-go ещё не знает, вместо отказа поднимать туннель целиком.
+//
+// Зачем: клиент Amnezia пишет в .conf весь набор своей версии, а ядро принимает только то, что
+// реализовано. Один незнакомый ключ — и IpcSet возвращает «invalid UAPI device key: j1», Start
+// падает, локация не подключается вообще. Ровно так и было: конфиги с J1..J3/Itime (мусорные
+// пакеты по таймеру из AmneziaWG 2.0) не работали НИ ОДИН, а WARP-конфиги, у которых этих ключей
+// нет, поднимались — отсюда «работает только warp».
+//
+// Почему выбрасывать безопасно ИМЕННО ТАК: отбрасывается только то, что ядро не умеет, и только
+// после того, как оно само об этом сказало. Ключи, которые ядро понимает (в том числе S3/S4 и
+// header_protection_key — набивка и заголовки ТРАНСПОРТНЫХ пакетов, без них туннель «поднят», а
+// трафика нет), проходят как раньше. J-пакеты — односторонний мусор: получатель их всё равно
+// отбрасывает, поэтому их отсутствие стоит только слабее замаскированного профиля трафика, а не
+// связи. Каждый отброшенный ключ пишется в журнал: если сервер на него рассчитывает, причина
+// будет видна сразу, а не превратится в очередное «просто не работает».
+//
+// Список ключей не захардкожен намеренно: на следующем обновлении ядра то, что оно научится
+// принимать, поедет само, а новый неизвестный ключ снова не уронит туннель.
+func ipcSetTolerant(d *device.Device, uapi string) error {
+	const maxDrops = 16
+	dropped := make([]string, 0, 4)
+	current := uapi
+	for i := 0; i <= maxDrops; i++ {
+		err := d.IpcSet(current)
+		if err == nil {
+			if len(dropped) > 0 {
+				log.New(logSink, "", 0).Printf(
+					"AmneziaWG: ядро не знает параметров %s — они пропущены (обфускация слабее, связь не затронута)",
+					strings.Join(dropped, ","))
+			}
+			return nil
+		}
+		key := unknownUapiKey(err)
+		if key == "" {
+			return err
+		}
+		next := stripUapiKey(current, key)
+		if next == current {
+			return err
+		}
+		dropped = append(dropped, key)
+		current = next
+	}
+	return d.IpcSet(current)
+}
+
+// unknownUapiKey достаёт имя ключа из ошибки устройства «invalid UAPI device key: <key>».
+// Пустая строка — ошибка другая, её глотать нельзя.
+func unknownUapiKey(err error) string {
+	const marker = "invalid UAPI device key: "
+	msg := err.Error()
+	idx := strings.Index(msg, marker)
+	if idx < 0 {
+		return ""
+	}
+	key := strings.TrimSpace(msg[idx+len(marker):])
+	if cut := strings.IndexAny(key, " \t\r\n"); cut >= 0 {
+		key = key[:cut]
+	}
+	return key
+}
+
+// stripUapiKey убирает из конфига строки `<key>=...`. Значение может быть любым (в том числе
+// «<b 0x...>»), поэтому сравнивается только имя до первого «=».
+func stripUapiKey(uapi, key string) string {
+	lines := strings.Split(uapi, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if eq := strings.IndexByte(line, '='); eq > 0 && line[:eq] == key {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// paramSummary перечисляет применённые параметры обфускации. Нужен в логе, потому что конфиг
+// AmneziaWG 2.0 несёт s3/s4 и header_protection_key, а 1.x — нет: по одной строке видно, в каком
+// режиме реально поднялся туннель, и совпадает ли он с тем, что ждёт сервер.
+func (c *wgConfig) paramSummary() string {
+	if len(c.awgParams) == 0 {
+		return "обфускации нет"
+	}
+	names := make([]string, 0, len(c.awgParams))
+	for _, kv := range c.awgParams {
+		names = append(names, kv[0])
+	}
+	return strings.Join(names, ",")
+}
+
+func keyToHex(b64 string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	if err != nil {
+		// maybe already hex
+		if _, herr := hex.DecodeString(b64); herr == nil {
+			return strings.ToLower(b64), nil
+		}
+		return "", err
+	}
+	if len(raw) != 32 {
+		return "", fmt.Errorf("key must be 32 bytes, got %d", len(raw))
+	}
+	return hex.EncodeToString(raw), nil
+}
+
+func resolveEndpoint(ep string) (string, error) {
+	host, port, err := net.SplitHostPort(ep)
+	if err != nil {
+		return "", err
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ep, nil
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(context.Background(), host)
+	if err != nil || len(addrs) == 0 {
+		return "", fmt.Errorf("resolve endpoint %s: %w", host, err)
+	}
+	return net.JoinHostPort(addrs[0].IP.String(), port), nil
+}

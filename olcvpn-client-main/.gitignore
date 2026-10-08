@@ -1,0 +1,29 @@
+# --- Build outputs ---
+**/build/
+**/.gradle/
+**/.kotlin/
+**/.cxx/
+*.apk
+*.aab
+*.aar
+
+# --- Local / secret config (never commit) ---
+**/local.properties
+**/keystore.properties
+*.keystore
+*.jks
+
+# --- Go ---
+**/vendor/
+
+# --- IDE / OS ---
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+
+# iOS: generated from YPtun/iosApp/project.yml by XcodeGen
+YPtun/iosApp/*.xcodeproj/

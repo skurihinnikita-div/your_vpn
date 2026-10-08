@@ -1,0 +1,1102 @@
+package org.olcbox.app.data.datasource
+
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.respond
+import io.ktor.http.HttpHeaders
+import io.ktor.http.headersOf
+import kotlinx.coroutines.test.runTest
+import org.olcbox.app.CurrentAppInfo
+import org.olcbox.app.data.identity.DeviceIdentityProvider
+import org.olcbox.app.data.model.LocationBundleV4
+import org.olcbox.app.data.model.LocationConfig
+import org.olcbox.app.data.model.LocationEntry
+import org.olcbox.app.data.share.ConfigShareService
+import org.olcbox.app.data.share.YptunInboundCodec
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+class LocationsRepositoryImplTest {
+
+    @Test
+    fun exportsAndImportsBundleV5WithActiveLocation() = runTest {
+        val first = LocationEntry.from(
+            "amsterdam",
+            LocationConfig(
+                name = "Amsterdam",
+                id = "room-a",
+                key = "key-a",
+                bypassProvider = LocationConfig.PROVIDER_JAZZ
+            )
+        )
+        val second = LocationEntry.from(
+            "berlin",
+            LocationConfig(
+                name = "Berlin",
+                id = "room-b",
+                key = "key-b",
+                bypassProvider = LocationConfig.PROVIDER_TELEMOST
+            )
+        )
+        val source = FakeLocationsDataSource(
+            stored = LocationBundleV4(
+                activeLocationId = "berlin",
+                locations = listOf(first, second)
+            )
+        )
+        val exported = LocationsRepositoryImpl(source).exportBundle()
+        assertTrue("\"version\": 5" in exported)
+        assertTrue("\"endpoint\"" in exported)
+        assertTrue("\"auth_provider\"" in exported)
+        assertTrue("\"client_id\"" !in exported)
+        assertTrue("\"bypass_provider\"" !in exported)
+        val importedSource = FakeLocationsDataSource()
+
+        LocationsRepositoryImpl(importedSource).importText(exported)
+
+        val imported = importedSource.stored
+        assertNotNull(imported)
+        assertEquals(5, imported.version)
+        assertEquals("berlin", imported.activeLocationId)
+        assertEquals(listOf("amsterdam", "berlin"), imported.locations.map { it.storageId })
+        assertEquals(
+            LocationConfig.PROVIDER_TELEMOST,
+            imported.locations[1].location.bypassProvider
+        )
+    }
+
+    @Test
+    fun migratesLegacyLocationsAndPreservesActiveSelection() = runTest {
+        val source = FakeLocationsDataSource(
+            legacy = listOf(
+                "legacy_a" to """{"name":"A","server":"room-a","password":"key-a","provider":"jazz"}""",
+                "legacy_b" to """{"name":"B","server":"room-b","password":"key-b","turn":{"type":"wbstream"}}"""
+            ),
+            legacyActive = "legacy_b"
+        )
+        val bundle = LocationsRepositoryImpl(source).getBundle()
+
+        assertEquals("legacy_b", bundle.activeLocationId)
+        assertEquals(listOf("legacy_a", "legacy_b"), bundle.locations.map { it.storageId })
+        assertEquals(LocationConfig.PROVIDER_WB_STREAM, bundle.locations[1].location.bypassProvider)
+        assertEquals(bundle, source.stored)
+    }
+
+    @Test
+    fun normalizesStoredWbStreamAliasToCanonicalProvider() = runTest {
+        val source = FakeLocationsDataSource(
+            stored = LocationBundleV4(
+                activeLocationId = "wb",
+                locations = listOf(
+                    LocationEntry(
+                        storageId = "wb",
+                        name = "WB",
+                        legacyId = "room-wb",
+                        legacyKey = "key-wb",
+                        legacyBypassProvider = "wbstream"
+                    )
+                )
+            )
+        )
+
+        val active = LocationsRepositoryImpl(source).getActiveLocation()
+
+        assertNotNull(active)
+        assertEquals(LocationConfig.PROVIDER_WB_STREAM, active.bypassProvider)
+        assertEquals(LocationConfig.PROVIDER_WB_STREAM, active.location.bypassProvider)
+    }
+
+    @Test
+    fun importsWbStreamAliasAsCanonicalProvider() = runTest {
+        val source = FakeLocationsDataSource()
+        val input = """
+            {
+              "version": 3,
+              "active_location_id": "wb",
+              "locations": [
+                {
+                  "storage_id": "wb",
+                  "name": "WB",
+                  "id": "room-wb",
+                  "key": "key-wb",
+                  "bypass_provider": "wbstream"
+                }
+              ]
+            }
+        """.trimIndent()
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        assertEquals(LocationConfig.PROVIDER_WB_STREAM, imported.locations.first().bypassProvider)
+    }
+
+    @Test
+    fun importsSingleLegacyLocationWithTurnProvider() = runTest {
+        val source = FakeLocationsDataSource()
+        val input = """
+            {
+              "hysteria": {
+                "name": "Paris",
+                "server": "room-paris",
+                "password": "key-paris"
+              },
+              "turn": {
+                "type": "telemost"
+              }
+            }
+        """.trimIndent()
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        assertEquals("imported_paris", imported.activeLocationId)
+        assertEquals(1, imported.locations.size)
+        assertEquals("room-paris", imported.locations.first().location.id)
+        assertEquals(
+            LocationConfig.PROVIDER_TELEMOST,
+            imported.locations.first().location.bypassProvider
+        )
+    }
+
+    @Test
+    fun importsLegacyOlcRtcUriWithClientIdAndMimoName() = runTest {
+        val source = FakeLocationsDataSource()
+        val input = "olcrtc://wbstream?seichannel@room-01#${"a".repeat(64)}%android-01${'$'}RU / olc free sub / IPv6"
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        val entry = imported.locations.single()
+        val location = entry.location
+        assertEquals(LocationConfig.PROVIDER_WB_STREAM, location.bypassProvider)
+        assertEquals(LocationConfig.TRANSPORT_SEICHANNEL, location.transport)
+        assertEquals("room-01", location.id)
+        assertEquals("RU / olc free sub / IPv6", location.name)
+        assertEquals("RU / olc free sub / IPv6", entry.metadata?.mimo)
+        assertNull(entry.metadata?.subscription)
+    }
+
+    @Test
+    fun importsJitsiOlcRtcUriWithRoomUrl() = runTest {
+        val source = FakeLocationsDataSource()
+        val key = "b".repeat(64)
+        val input = "olcrtc://jitsi?datachannel@https://meet.cryptopro.ru/myroom#$key${'$'}Jitsi room"
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        val location = imported.locations.single().location
+        assertEquals(LocationConfig.PROVIDER_JITSI, location.bypassProvider)
+        assertEquals(LocationConfig.TRANSPORT_DATACHANNEL, location.transport)
+        assertEquals("https://meet.cryptopro.ru/myroom", location.id)
+        assertEquals("Jitsi room", location.name)
+    }
+
+    @Test
+    fun importsOlcRtcSubscriptionAndAppliesLocalNames() = runTest {
+        val source = FakeLocationsDataSource()
+        val input = """
+            #name: Test subscription
+            #update: 1778011200
+            #refresh: 10m
+            #color: #4A90E2
+            #icon: flag-ru
+            #used: 10mb/10gb
+            #available: 9.99gb
+
+            olcrtc://wbstream?seichannel@room-01#${"a".repeat(64)}%android-01${'$'}RU / default name
+            ##name: RU-1
+            ##color: #4A90E2
+            ##icon: node-ru
+            ##used: 500mb/10gb
+            ##available: 9.5gb
+            ##ip: 203.0.113.10
+            ##comment: primary
+
+            olcrtc://jazz?datachannel@room-02#${"b".repeat(64)}%android-02${'$'}DE / backup
+            ##name: DE-Backup
+        """.trimIndent()
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        assertEquals(listOf("RU-1", "DE-Backup"), imported.locations.map { it.location.name })
+        assertEquals(
+            listOf(LocationConfig.PROVIDER_WB_STREAM, LocationConfig.PROVIDER_JAZZ),
+            imported.locations.map { it.location.bypassProvider }
+        )
+        assertEquals("imported_ru-1", imported.activeLocationId)
+
+        val firstMetadata = imported.locations[0].metadata
+        assertNotNull(firstMetadata)
+        assertEquals("RU-1", firstMetadata.name)
+        assertEquals("#4A90E2", firstMetadata.color)
+        assertEquals("node-ru", firstMetadata.icon)
+        assertEquals("500mb/10gb", firstMetadata.used)
+        assertEquals("9.5gb", firstMetadata.available)
+        assertEquals("203.0.113.10", firstMetadata.ip)
+        assertEquals("primary", firstMetadata.comment)
+        assertEquals("RU / default name", firstMetadata.mimo)
+
+        val subscriptionMetadata = firstMetadata.subscription
+        assertNotNull(subscriptionMetadata)
+        assertEquals("Test subscription", subscriptionMetadata.name)
+        assertEquals("1778011200", subscriptionMetadata.update)
+        assertEquals("10m", subscriptionMetadata.refresh)
+        assertEquals("#4A90E2", subscriptionMetadata.color)
+        assertEquals("flag-ru", subscriptionMetadata.icon)
+        assertEquals("10mb/10gb", subscriptionMetadata.used)
+        assertEquals("9.99gb", subscriptionMetadata.available)
+        assertEquals(subscriptionMetadata, imported.locations[1].metadata?.subscription)
+    }
+
+    fun importUpdatesMatchingStorageIdsAndAppendsNewLocations() = runTest {
+        val source = FakeLocationsDataSource(
+            stored = LocationBundleV4(
+                activeLocationId = "custom_paris",
+                locations = listOf(
+                    LocationEntry.from(
+                        "custom_paris",
+                        LocationConfig(
+                            name = "Paris",
+                            id = "room-old",
+                            key = "a".repeat(64),
+                            bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+                        )
+                    ),
+                    LocationEntry.from(
+                        "custom_berlin",
+                        LocationConfig(
+                            name = "Berlin",
+                            id = "room-berlin",
+                            key = "b".repeat(64),
+                            bypassProvider = LocationConfig.PROVIDER_TELEMOST
+                        )
+                    )
+                )
+            )
+        )
+        val input = """
+            {
+              "version": 4,
+              "active_location_id": "sub_wb",
+              "locations": [
+                {
+                  "storage_id": "custom_paris",
+                  "name": "Paris updated",
+                  "endpoint": {
+                    "room_id": "room-new",
+                    "key": "${"c".repeat(64)}",
+                    "client_id": "phone-1"
+                  },
+                  "carrier": "wbstream",
+                  "transport": {
+                    "type": "datachannel"
+                  }
+                },
+                {
+                  "storage_id": "sub_wb",
+                  "name": "WB sub",
+                  "subscription_url": "https://example.com/sub.md",
+                  "endpoint": {
+                    "room_id": "room-sub",
+                    "key": "${"d".repeat(64)}",
+                    "client_id": "phone-2"
+                  },
+                  "carrier": "wbstream",
+                  "transport": {
+                    "type": "vp8channel"
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        assertEquals(listOf("custom_paris", "custom_berlin", "sub_wb"), imported.locations.map { it.storageId })
+        assertEquals("room-new", imported.locations[0].location.id)
+        assertEquals("room-berlin", imported.locations[1].location.id)
+        assertEquals("https://example.com/sub.md", imported.locations[2].subscriptionUrl)
+        assertEquals("sub_wb", imported.activeLocationId)
+    }
+
+    @Test
+    fun invalidLocationCannotBecomeActiveLocation() = runTest {
+        val source = FakeLocationsDataSource()
+        val incomplete = LocationConfig(name = "Broken", id = "room", key = "")
+
+        LocationsRepositoryImpl(source).saveLocation("broken", incomplete)
+
+        val bundle = source.stored
+        assertNotNull(bundle)
+        assertNull(bundle.activeLocationId)
+        assertTrue(bundle.locations.isEmpty())
+    }
+
+    @Test
+    fun importedTransportSurvivesForEveryProvider() = runTest {
+        val source = FakeLocationsDataSource()
+        val input = """
+            {
+              "version": 3,
+              "locations": [
+                {
+                  "storage_id": "telemost",
+                  "name": "Telemost",
+                  "id": "75047680642749",
+                  "key": "${"a".repeat(64)}",
+                  "bypass_provider": "telemost",
+                  "transport": "datachannel"
+                },
+                {
+                  "storage_id": "wb",
+                  "name": "WB",
+                  "id": "room-wb",
+                  "key": "${"b".repeat(64)}",
+                  "bypass_provider": "wbstream",
+                  "transport": "datachannel"
+                }
+              ]
+            }
+        """.trimIndent()
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        // Раньше telemost+datachannel подменялся на vp8 прямо при импорте, и поднятый на VPS сервер
+        // было нечем открыть. Теперь транспорт из конфига доезжает как есть — для любого сервиса.
+        assertEquals(LocationConfig.TRANSPORT_DATACHANNEL, imported.locations[0].location.transport)
+        assertEquals(LocationConfig.TRANSPORT_DATACHANNEL, imported.locations[1].location.transport)
+    }
+
+    @Test
+    fun importsVideochannelTransport() = runTest {
+        val source = FakeLocationsDataSource()
+        val input = """
+            {
+              "version": 4,
+              "active_location_id": "telemost-video",
+              "locations": [
+                {
+                  "storage_id": "telemost-video",
+                  "name": "Telemost Video",
+                  "endpoint": {
+                    "room_id": "75047680642749",
+                    "key": "${"c".repeat(64)}"
+                  },
+                  "carrier": "telemost",
+                  "transport": {
+                    "type": "videochannel"
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        val location = imported.locations.first().location
+        assertEquals(5, imported.version)
+        assertEquals(LocationConfig.PROVIDER_TELEMOST, location.bypassProvider)
+        // videochannel is a real olcRTC transport (docs/settings.md) — it used to be swapped for vp8.
+        assertEquals(LocationConfig.TRANSPORT_VIDEOCHANNEL, location.transport)
+    }
+
+    /** The full example of olcRTC's own subscription format (olcrtc/docs/sub.md, format v1). */
+    @Test
+    fun importsTheOlcRtcSubscriptionFormatWithTransportParameters() = runTest {
+        val source = FakeLocationsDataSource()
+        val key = "d823fa01cb3e0609b67322f7cf984c4ee2e4ce2e294936fc24ef38c9e59f4799"
+        val input = """
+            #name: Zarazaex Free RU
+            #update: 1778011200
+            #refresh: 10m
+            #color: #4A90E2
+            #icon: 🇷🇺
+            #used: 10mb/10gb
+            #available: 9.99gb
+
+            olcrtc://wbstream?seichannel<fps=60&batch=64&frag=900&ack-ms=2000>@room-01#$key${'$'}RU / olcng free sub / IPv6
+            ##name: RU-1
+            ##icon: 🇷🇺
+            ##comment: basic free node
+
+            olcrtc://jitsi?videochannel<video-w=1080&video-h=1080&video-codec=tile&video-tile-rs=20>@https://meet.jit.si/room-02#${"a".repeat(64)}${'$'}DE / backup
+            ##name: DE-Backup
+        """.trimIndent()
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = assertNotNull(source.stored)
+        val (sei, video) = imported.locations.map { it.location }
+        assertEquals(listOf("RU-1", "DE-Backup"), listOf(sei.name, video.name))
+
+        assertEquals(LocationConfig.TRANSPORT_SEICHANNEL, sei.transport)
+        val seiOptions = sei.seiOptions()
+        assertEquals(listOf(60, 64, 900, 2000), listOf(seiOptions.fps, seiOptions.batch, seiOptions.fragmentSize, seiOptions.ackTimeoutMs))
+
+        assertEquals(LocationConfig.TRANSPORT_VIDEOCHANNEL, video.transport)
+        val videoOptions = video.videoOptions()
+        assertEquals("tile", videoOptions.codec)
+        assertEquals(1080 to 1080, videoOptions.width to videoOptions.height)
+        assertEquals(20, videoOptions.tileRs)
+
+        // "#refresh: 10m" → the hourly auto-updater checks it every hour.
+        assertEquals(1, imported.locations[0].metadata?.subscription?.updateIntervalHours)
+
+        // A share link opens the same way elsewhere: parameters survive export → import.
+        val shared = ConfigShareService.olcRtcUri(sei)
+        assertTrue("seichannel<fps=60&batch=64&frag=900&ack-ms=2000>" in shared, shared)
+        val again = FakeLocationsDataSource()
+        LocationsRepositoryImpl(again).importText(ConfigShareService.olcRtcUri(video))
+        assertEquals(video.videoOptions(), assertNotNull(again.stored).locations.single().location.videoOptions())
+    }
+
+    @Test
+    fun exposesAllWorkingProviderTransportPairs() {
+        // Ни одна пара сервис/транспорт не вырезается: ядро регистрирует транспорты глобально, и
+        // сервер спокойно поднимается, например, в telemost+datachannel. Порядок = подсказка
+        // «лучшее первым», а не запрет.
+        assertEquals(
+            listOf(
+                LocationConfig.TRANSPORT_VP8CHANNEL,
+                LocationConfig.TRANSPORT_VIDEOCHANNEL,
+                LocationConfig.TRANSPORT_SEICHANNEL,
+                LocationConfig.TRANSPORT_DATACHANNEL
+            ),
+            LocationConfig.supportedTransportsForProvider(LocationConfig.PROVIDER_TELEMOST)
+        )
+        assertEquals(
+            listOf(
+                LocationConfig.TRANSPORT_DATACHANNEL,
+                LocationConfig.TRANSPORT_VP8CHANNEL,
+                LocationConfig.TRANSPORT_SEICHANNEL,
+                LocationConfig.TRANSPORT_VIDEOCHANNEL
+            ),
+            LocationConfig.supportedTransportsForProvider(LocationConfig.PROVIDER_JAZZ)
+        )
+        assertEquals(
+            listOf(
+                LocationConfig.TRANSPORT_VP8CHANNEL,
+                LocationConfig.TRANSPORT_SEICHANNEL,
+                LocationConfig.TRANSPORT_VIDEOCHANNEL,
+                LocationConfig.TRANSPORT_DATACHANNEL
+            ),
+            LocationConfig.supportedTransportsForProvider(LocationConfig.PROVIDER_WB_STREAM)
+        )
+        // Jitsi carries all four: the olcRTC core registers transports globally and the auth
+        // provider is independent of them. datachannel stays FIRST because it is the default and
+        // the known-good pairing.
+        assertEquals(
+            listOf(
+                LocationConfig.TRANSPORT_DATACHANNEL,
+                LocationConfig.TRANSPORT_VP8CHANNEL,
+                LocationConfig.TRANSPORT_SEICHANNEL,
+                LocationConfig.TRANSPORT_VIDEOCHANNEL
+            ),
+            LocationConfig.supportedTransportsForProvider(LocationConfig.PROVIDER_JITSI)
+        )
+        // A transport the provider does support is kept as-is...
+        assertEquals(
+            LocationConfig.TRANSPORT_VP8CHANNEL,
+            LocationConfig.normalizeTransport(LocationConfig.TRANSPORT_VP8CHANNEL, LocationConfig.PROVIDER_JITSI)
+        )
+        // ...и раньше НЕ поддержанный подменялся на первый из списка. Теперь подменять нечего:
+        // выбранный пользователем транспорт доезжает до конфига как есть, каким бы ни был сервис.
+        assertEquals(
+            LocationConfig.TRANSPORT_DATACHANNEL,
+            LocationConfig.normalizeTransport(LocationConfig.TRANSPORT_DATACHANNEL, LocationConfig.PROVIDER_TELEMOST)
+        )
+    }
+
+    @Test
+    fun olcRtcSingleProfileImportDoesNotOverwriteExistingStorageId() = runTest {
+        val source = FakeLocationsDataSource(
+            stored = LocationBundleV4(
+                activeLocationId = "imported_room-01",
+                locations = listOf(
+                    LocationEntry.from(
+                        "imported_room-01",
+                        LocationConfig(
+                            name = "Old",
+                            id = "room-old",
+                            key = "a".repeat(64),
+                            bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+                        )
+                    )
+                )
+            )
+        )
+
+        LocationsRepositoryImpl(source).importText(
+            "olcrtc://wbstream?seichannel@room-01#${"b".repeat(64)}${'$'}New"
+        )
+
+        val imported = source.stored
+        assertNotNull(imported)
+        assertEquals(listOf("imported_room-01", "imported_new"), imported.locations.map { it.storageId })
+        assertEquals("room-old", imported.locations[0].location.id)
+        assertEquals("room-01", imported.locations[1].location.id)
+        // An additive import must NOT move the selection: pasting a config while the VPN is up
+        // otherwise re-points the active location and the list starts drawing the running
+        // tunnel's traffic on the freshly pasted entry.
+        assertEquals("imported_room-01", imported.activeLocationId)
+    }
+
+    @Test
+    fun importsAYptunInboundLinkThatArrivedWrapped() = runTest {
+        // The importer splits a paste by line; a long link broken across lines by a chat client or a
+        // QR overlay lost everything after the first fragment and read as "no valid config".
+        val link = YptunInboundCodec.compose(
+            LocationConfig(
+                name = "Wrapped",
+                id = "room-wrapped",
+                key = "d".repeat(64),
+                bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+            )
+        )
+        val source = FakeLocationsDataSource()
+
+        assertTrue(LocationsRepositoryImpl(source).importText(link.chunked(40).joinToString("\n")))
+
+        val imported = source.stored
+        assertNotNull(imported)
+        assertEquals("room-wrapped", imported.locations.single().location.id)
+    }
+
+    @Test
+    fun additiveImportKeepsTheActiveLocationButRestoreCarriesItsOwn() = runTest {
+        fun bundleWithActive() = LocationBundleV4(
+            activeLocationId = "keep_me",
+            locations = listOf(
+                LocationEntry.from(
+                    "keep_me",
+                    LocationConfig(
+                        name = "Running",
+                        id = "room-live",
+                        key = "a".repeat(64),
+                        bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+                    )
+                )
+            )
+        )
+
+        val additive = FakeLocationsDataSource(stored = bundleWithActive())
+        LocationsRepositoryImpl(additive).importText(
+            "olcrtc://wbstream?seichannel@room-99#${"b".repeat(64)}${'$'}Pasted"
+        )
+        val afterAdditive = additive.stored
+        assertNotNull(afterAdditive)
+        assertEquals(2, afterAdditive.locations.size)
+        assertEquals("keep_me", afterAdditive.activeLocationId)
+
+        // A Restore (a whole exported bundle) still carries its own active id back in.
+        val restore = FakeLocationsDataSource(stored = bundleWithActive())
+        LocationsRepositoryImpl(restore).importText(
+            """
+            {
+              "version": 4,
+              "active_location_id": "keep_me",
+              "locations": [
+                {
+                  "storage_id": "keep_me",
+                  "name": "Restored",
+                  "endpoint": {
+                    "room_id": "room-restored",
+                    "key": "${"b".repeat(64)}",
+                    "client_id": "desktop"
+                  },
+                  "carrier": "wbstream",
+                  "transport": {"type": "datachannel"}
+                }
+              ]
+            }
+            """.trimIndent()
+        )
+        val afterRestore = restore.stored
+        assertNotNull(afterRestore)
+        assertEquals("keep_me", afterRestore.activeLocationId)
+        assertEquals("room-restored", afterRestore.locations.single().location.id)
+    }
+
+    @Test
+    fun bundleRestoreUpdatesMatchingStorageIds() = runTest {
+        val source = FakeLocationsDataSource(
+            stored = LocationBundleV4(
+                activeLocationId = "same",
+                locations = listOf(
+                    LocationEntry.from(
+                        "same",
+                        LocationConfig(
+                            name = "Old",
+                            id = "room-old",
+                            key = "a".repeat(64),
+                            bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+                        )
+                    )
+                )
+            )
+        )
+
+        val input = """
+            {
+              "version": 4,
+              "active_location_id": "same",
+              "locations": [
+                {
+                  "storage_id": "same",
+                  "name": "Updated",
+                  "endpoint": {
+                    "room_id": "room-new",
+                    "key": "${"b".repeat(64)}",
+                    "client_id": "desktop"
+                  },
+                  "carrier": "wbstream",
+                  "transport": {"type": "datachannel"}
+                }
+              ]
+            }
+        """.trimIndent()
+
+        LocationsRepositoryImpl(source).importText(input)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        assertEquals(listOf("same"), imported.locations.map { it.storageId })
+        assertEquals("room-new", imported.locations.single().location.id)
+    }
+
+    @Test
+    fun subscriptionHeaderSetsIntervalAndIdentityHeaders() = runTest {
+        var userAgent: String? = null
+        var hwid: String? = null
+        val engine = MockEngine { request ->
+            // One import now fires several requests: the main fetch, the Remnawave /info probe and a
+            // separate Happ-UA fetch used purely for FakeDNS enrichment. Only the FIRST carries the
+            // user's chosen UA, so capture that one instead of whichever happens to be last.
+            if (userAgent == null) {
+                userAgent = request.headers[HttpHeaders.UserAgent]
+                hwid = request.headers["x-hwid"]
+            }
+            respond(
+                content = "olcrtc://wbstream?vp8channel@room#${"c".repeat(64)}${'$'}Sub",
+                headers = headersOf("profile-update-interval", "6")
+            )
+        }
+        val source = FakeLocationsDataSource()
+
+        LocationsRepositoryImpl(
+            dataSource = source,
+            httpClient = HttpClient(engine),
+            deviceIdentityProvider = StaticIdentityProvider("hwid-test")
+        ).importText("https://example.test/sub.txt")
+
+        val imported = source.stored
+        assertNotNull(imported)
+        assertEquals(CurrentAppInfo.userAgent, userAgent)
+        assertEquals("hwid-test", hwid)
+        assertEquals(6, imported.locations.single().metadata?.subscription?.updateIntervalHours)
+        assertEquals("https://example.test/sub.txt", imported.locations.single().subscriptionUrl)
+    }
+
+    @Test
+    fun subscriptionImportFallsBackWhenIdentityResponseIsNotConfig() = runTest {
+        val userAgents = mutableListOf<String?>()
+        val hwids = mutableListOf<String?>()
+        val engine = MockEngine { request ->
+            userAgents += request.headers[HttpHeaders.UserAgent]
+            hwids += request.headers["x-hwid"]
+            // The panel refuses the identity-mode request (the one carrying x-hwid) and serves a
+            // config only to the anonymous Compatibility retry. Keyed on the header rather than on a
+            // request count: one import fires several requests (main, /info, Happ-UA FakeDNS).
+            if (hwids.last() != null) {
+                respond("<html>blocked</html>")
+            } else {
+                respond(
+                    content = "\uFEFFolcrtc://wbstream?vp8channel@room#${"d".repeat(64)}${'$'}Fallback",
+                    headers = headersOf("profile-update-interval", "12")
+                )
+            }
+        }
+        val source = FakeLocationsDataSource()
+
+        val imported = LocationsRepositoryImpl(
+            dataSource = source,
+            httpClient = HttpClient(engine),
+            deviceIdentityProvider = StaticIdentityProvider("hwid-test")
+        ).importText("http://example.test/sub.txt")
+
+        val bundle = source.stored
+        assertTrue(imported)
+        assertNotNull(bundle)
+        assertEquals(CurrentAppInfo.userAgent, userAgents.first())
+        assertEquals("hwid-test", hwids.first())
+        // The retry is the Compatibility-mode attempt: it drops the identity headers (x-hwid and
+        // the device descriptors). The User-Agent itself stays the app's own — the browser-UA
+        // fallback this test used to assert no longer exists in the fetch path.
+        val retry = hwids.indexOfFirst { it == null }
+        assertTrue(retry > 0, "expected an anonymous retry after the identity attempt")
+        assertEquals(CurrentAppInfo.userAgent, userAgents[retry])
+        assertEquals("room", bundle.locations.single().location.id)
+        assertEquals(12, bundle.locations.single().metadata?.subscription?.updateIntervalHours)
+        assertEquals("http://example.test/sub.txt", bundle.locations.single().subscriptionUrl)
+    }
+
+    @Test
+    fun refreshSingleSubscriptionPreservesOtherSubscriptions() = runTest {
+        val source = FakeLocationsDataSource(
+            stored = LocationBundleV4(
+                activeLocationId = "beta",
+                locations = listOf(
+                    LocationEntry.from(
+                        "alpha",
+                        LocationConfig(
+                            name = "Alpha",
+                            id = "room-alpha",
+                            key = "a".repeat(64),
+                            bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+                        ),
+                        subscriptionUrl = "https://example.test/alpha"
+                    ),
+                    LocationEntry.from(
+                        "beta",
+                        LocationConfig(
+                            name = "Beta",
+                            id = "room-beta",
+                            key = "b".repeat(64),
+                            bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+                        ),
+                        subscriptionUrl = "https://example.test/beta"
+                    )
+                )
+            )
+        )
+        val engine = MockEngine { request ->
+            respond("olcrtc://wbstream?vp8channel@room-alpha-new#${"c".repeat(64)}${'$'}Alpha")
+        }
+
+        val updated = LocationsRepositoryImpl(
+            dataSource = source,
+            httpClient = HttpClient(engine),
+            deviceIdentityProvider = StaticIdentityProvider("hwid-test")
+        ).refreshSubscription("https://example.test/alpha")
+
+        val bundle = source.stored
+        assertEquals(1, updated)
+        assertNotNull(bundle)
+        assertEquals(listOf("beta", "imported_alpha"), bundle.locations.map { it.storageId })
+        assertEquals("room-beta", bundle.locations.first { it.storageId == "beta" }.location.id)
+        assertEquals("https://example.test/beta", bundle.locations.first { it.storageId == "beta" }.subscriptionUrl)
+        assertEquals("room-alpha-new", bundle.locations.first { it.subscriptionUrl == "https://example.test/alpha" }.location.id)
+        assertEquals("beta", bundle.activeLocationId)
+    }
+
+    @Test
+    fun failedSingleSubscriptionRefreshDoesNotDropExistingSubscription() = runTest {
+        val source = FakeLocationsDataSource(
+            stored = LocationBundleV4(
+                activeLocationId = "alpha",
+                locations = listOf(
+                    LocationEntry.from(
+                        "alpha",
+                        LocationConfig(
+                            name = "Alpha",
+                            id = "room-alpha",
+                            key = "a".repeat(64),
+                            bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+                        ),
+                        subscriptionUrl = "https://example.test/alpha"
+                    )
+                )
+            )
+        )
+        val engine = MockEngine {
+            respond("<html>not a config</html>")
+        }
+
+        val updated = LocationsRepositoryImpl(
+            dataSource = source,
+            httpClient = HttpClient(engine),
+            deviceIdentityProvider = StaticIdentityProvider("hwid-test")
+        ).refreshSubscription("https://example.test/alpha")
+
+        val bundle = source.stored
+        assertEquals(0, updated)
+        assertNotNull(bundle)
+        assertEquals(listOf("alpha"), bundle.locations.map { it.storageId })
+        assertEquals("room-alpha", bundle.locations.single().location.id)
+        assertEquals("alpha", bundle.activeLocationId)
+    }
+
+    @Test
+    fun refreshKeepsSelectedServerWhenItStillExists() = runTest {
+        val url = "https://example.test/multi"
+        val source = FakeLocationsDataSource(
+            stored = LocationBundleV4(
+                activeLocationId = "srv-b",
+                locations = listOf(
+                    LocationEntry.from(
+                        "srv-a",
+                        LocationConfig(
+                            name = "A", id = "room-a", key = "a".repeat(64),
+                            bypassProvider = LocationConfig.PROVIDER_WB_STREAM,
+                            transport = LocationConfig.TRANSPORT_VP8CHANNEL
+                        ),
+                        subscriptionUrl = url
+                    ),
+                    LocationEntry.from(
+                        "srv-b",
+                        LocationConfig(
+                            name = "B", id = "room-b", key = "b".repeat(64),
+                            bypassProvider = LocationConfig.PROVIDER_WB_STREAM,
+                            transport = LocationConfig.TRANSPORT_VP8CHANNEL
+                        ),
+                        subscriptionUrl = url
+                    )
+                )
+            )
+        )
+        // The refresh returns the SAME two servers, so both are reused (signatures match) and keep
+        // their storage ids. The previously-selected server (srv-b) must stay selected instead of
+        // snapping back to the first one — the on-launch-refresh "forgets my server" bug.
+        val payload = "olcrtc://wbstream?vp8channel@room-a#${"a".repeat(64)}${'$'}A\n" +
+            "olcrtc://wbstream?vp8channel@room-b#${"b".repeat(64)}${'$'}B"
+        val engine = MockEngine { respond(payload) }
+
+        val updated = LocationsRepositoryImpl(
+            dataSource = source,
+            httpClient = HttpClient(engine),
+            deviceIdentityProvider = StaticIdentityProvider("hwid-test")
+        ).refreshSubscription(url)
+
+        val bundle = source.stored
+        assertEquals(1, updated)
+        assertNotNull(bundle)
+        assertEquals(setOf("srv-a", "srv-b"), bundle.locations.map { it.storageId }.toSet())
+        assertEquals("srv-b", bundle.activeLocationId)
+    }
+
+    @Test
+    fun configShareRoundTripsTransportOptions() = runTest {
+        val source = FakeLocationsDataSource()
+        val config = LocationConfig(
+            name = "Shared",
+            id = "room",
+            key = "d".repeat(64),
+            bypassProvider = LocationConfig.PROVIDER_WB_STREAM,
+            transport = LocationConfig.TRANSPORT_VP8CHANNEL,
+            vp8Fps = 48,
+            vp8Batch = 32
+        )
+
+        val shared = ConfigShareService.olcRtcUri(config)
+        assertTrue("%" !in shared)
+
+        LocationsRepositoryImpl(source).importText(shared)
+
+        val imported = source.stored
+        assertNotNull(imported)
+        assertEquals(48, imported.locations.single().location.vp8Fps)
+        assertEquals(32, imported.locations.single().location.vp8Batch)
+    }
+
+    @Test
+    fun subscriptionSharingListsDistinctUrls() {
+        val first = LocationEntry.from(
+            "first",
+            LocationConfig(
+                name = "First",
+                id = "room-a",
+                key = "a".repeat(64),
+                bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+            ),
+            subscriptionUrl = "https://example.test/a"
+        )
+        val second = LocationEntry.from(
+            "second",
+            LocationConfig(
+                name = "Second",
+                id = "room-b",
+                key = "b".repeat(64),
+                bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+            ),
+            subscriptionUrl = "https://example.test/b"
+        )
+        val third = LocationEntry.from(
+            "third",
+            LocationConfig(
+                name = "Third",
+                id = "room-c",
+                key = "c".repeat(64),
+                bypassProvider = LocationConfig.PROVIDER_WB_STREAM
+            ),
+            subscriptionUrl = "https://example.test/a"
+        )
+
+        val items = ConfigShareService.subscriptionShareItems(listOf(first, second, third))
+
+        assertEquals(listOf("https://example.test/a", "https://example.test/b"), items.map { it.url })
+        assertEquals(2, items.first().locationCount)
+        assertEquals("https://example.test/b", ConfigShareService.subscriptionQrText(items[1].url))
+    }
+
+    /**
+     * A subscription that grows between refreshes must not lose servers. All proxy locations used to
+     * share one refresh signature, so old ids were handed out by POSITION, and a new server's generated
+     * id (`imported_location` for a Cyrillic name) could equal an id just reused by position — the
+     * bundle's distinctBy(storageId) then silently dropped the LAST server, on every later refresh too.
+     */
+    @Test
+    fun growingSubscriptionKeepsEveryServerAndItsId() = runTest {
+        fun link(host: String, name: String) =
+            "vless://11111111-2222-3333-4444-555555555555@$host:443?type=tcp&security=tls#$name"
+        var body = listOf(link("a.test", "Рига"), link("b.test", "Хельсинки")).joinToString("\n")
+        val source = FakeLocationsDataSource()
+        val repo = LocationsRepositoryImpl(
+            dataSource = source,
+            httpClient = HttpClient(MockEngine { respond(body) }),
+            deviceIdentityProvider = StaticIdentityProvider("hwid-test")
+        )
+        val url = "https://example.test/grow"
+        repo.importText(url)
+        val rigaId = source.stored!!.locations.single { it.name == "Рига" }.storageId
+
+        body += "\n" + link("c.test", "Стокгольм")
+        repo.refreshSubscription(url)
+        // A server inserted at the FRONT shifts every position.
+        body = link("d.test", "Алматы") + "\n" + body + "\n" + link("e.test", "Нюрнберг")
+        repo.refreshSubscription(url)
+
+        val locations = source.stored!!.locations
+        assertEquals(
+            listOf("Алматы", "Рига", "Хельсинки", "Стокгольм", "Нюрнберг"),
+            locations.map { it.name }
+        )
+        assertEquals(locations.size, locations.map { it.storageId }.toSet().size)
+        // The id (selection, pings) follows the server, not its position in the list.
+        assertEquals(rigaId, locations.single { it.name == "Рига" }.storageId)
+    }
+
+    /** VK-TURN servers keep their ids across a refresh that inserts a server AND renames one upstream. */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    @Test
+    fun freeturnSubscriptionKeepsEveryServerAndItsId() = runTest {
+        val wgConf = listOf(
+            "[Interface]",
+            "PrivateKey = QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVoxMjM0NTY3OD0=",
+            "Address = 10.7.3.2/32",
+            "",
+            "[Peer]",
+            "PublicKey = cGVlcl9wdWJsaWNfa2V5X2Jhc2U2NF8zMl9ieXRlc19vaz0=",
+            "Endpoint = 127.0.0.1:9000",
+            "AllowedIPs = 0.0.0.0/0",
+        ).joinToString("\n")
+        val wg = kotlin.io.encoding.Base64.UrlSafe.encode(wgConf.encodeToByteArray()).trimEnd('=')
+        fun link(ip: String, name: String) =
+            "freeturn://vk?tcp<mode=udp&obf-profile=rtpopus&wg=$wg>@$ip:56000#deadbeef${'$'}$name"
+        var body = listOf(link("198.51.100.1", "Нода 1"), link("198.51.100.2", "Нода 2")).joinToString("\n")
+        val source = FakeLocationsDataSource()
+        val repo = LocationsRepositoryImpl(
+            dataSource = source,
+            httpClient = HttpClient(MockEngine { respond(body) }),
+            deviceIdentityProvider = StaticIdentityProvider("hwid-test")
+        )
+        val url = "https://example.test/freeturn-grow"
+        repo.importText(url)
+        val imported = source.stored!!.locations
+        assertEquals(listOf("Нода 1", "Нода 2"), imported.map { it.name })
+        val node1Id = imported.single { it.name == "Нода 1" }.storageId
+
+        body = listOf(
+            link("198.51.100.3", "Нода 0"),
+            link("198.51.100.1", "Нода 1 (NL)"),
+            link("198.51.100.2", "Нода 2"),
+        ).joinToString("\n")
+        repo.refreshSubscription(url)
+
+        val locations = source.stored!!.locations
+        assertEquals(listOf("Нода 0", "Нода 1 (NL)", "Нода 2"), locations.map { it.name })
+        assertEquals(locations.size, locations.map { it.storageId }.toSet().size)
+        assertEquals(node1Id, locations.single { it.name == "Нода 1 (NL)" }.storageId)
+    }
+
+    /**
+     * A panel serving links to our UA and full Xray JSON to Happ's: a plain tcp/tls server whose JSON
+     * brings its OWN routing must run that JSON verbatim — before only xhttp got the swap, so every other
+     * server lost the panel's routing (RU direct, torrents blocked) on the link-parsed typed path.
+     */
+    @Test
+    fun jsonSubscriptionRoutingIsKeptForEveryServer() = runTest {
+        val link = "vless://732c8764-e31d-49ab-852b-54cb0f7cc3de@spb.example.test:443" +
+            "?type=tcp&security=tls&sni=spb.example.test#SPB"
+        val json = """
+            [{
+              "remarks": "SPB",
+              "dns": { "hosts": { "regexp:(^|\\.)ru${'$'}": "198.18.0.2" }, "servers": ["1.1.1.1"] },
+              "routing": { "domainStrategy": "IPOnDemand", "rules": [
+                { "type": "field", "ip": ["198.18.0.0/15"], "outboundTag": "direct" },
+                { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" }
+              ] },
+              "outbounds": [
+                { "tag": "proxy", "protocol": "vless", "settings": { "vnext": [ { "address": "spb.example.test", "port": 443,
+                  "users": [ { "id": "732c8764-e31d-49ab-852b-54cb0f7cc3de", "encryption": "none" } ] } ] },
+                  "streamSettings": { "network": "tcp", "security": "tls" } },
+                { "tag": "direct", "protocol": "freedom" },
+                { "tag": "block", "protocol": "blackhole" }
+              ]
+            }]
+        """.trimIndent()
+        val engine = MockEngine { request ->
+            val happ = request.headers[HttpHeaders.UserAgent].orEmpty().startsWith("Happ")
+            respond(if (happ) json else link)
+        }
+        val source = FakeLocationsDataSource()
+        LocationsRepositoryImpl(source, HttpClient(engine), StaticIdentityProvider("hwid-test"))
+            .importText("https://example.test/panel")
+
+        val entry = source.stored!!.locations.single()
+        assertEquals("SPB", entry.name)
+        assertEquals(org.olcbox.app.data.model.ProxyCore.Xray, entry.core)
+        val raw = entry.proxy?.rawXrayConfig.orEmpty()
+        assertTrue("bittorrent" in raw && "198.18.0.0/15" in raw, raw)
+    }
+
+    private class FakeLocationsDataSource(
+        var stored: LocationBundleV4? = null,
+        private val legacy: List<Pair<String, String>> = emptyList(),
+        private val legacyActive: String? = null
+    ) : LocationsDataSource {
+
+        override suspend fun loadLocationBundle(): LocationBundleV4? = stored
+
+        override suspend fun saveLocationBundle(bundle: LocationBundleV4) {
+            stored = bundle
+        }
+
+        override suspend fun loadLegacyLocations(): List<Pair<String, String>> = legacy
+
+        override suspend fun loadLegacyActiveLocationId(): String? = legacyActive
+    }
+
+    private class StaticIdentityProvider(
+        private val value: String
+    ) : DeviceIdentityProvider {
+        override suspend fun hwid(): String = value
+        override suspend fun appId(): String = value
+    }
+}

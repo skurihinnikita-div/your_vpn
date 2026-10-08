@@ -1,0 +1,364 @@
+package org.olcbox.app.vpn.singbox
+
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import org.olcbox.app.data.model.RoutingProfile
+import org.olcbox.app.data.model.SingBoxRule
+
+/**
+ * Translates a [RoutingProfile] into sing-box `route.rules` + `route.rule_set` fragments.
+ *
+ * sing-box (unlike Xray) has no native `geosite:`/`geoip:` selectors: geo categories are referenced
+ * through downloaded `.srs` rule-sets. So `geosite:ru` becomes a remote rule-set tagged `geosite-ru`
+ * pulled from [geositeBase], and `geoip:ru` becomes `geoip-ru` from [geoipBase] — the same mechanism
+ * the toggle-based bypass-Russia / block-ads rules already use.
+ *
+ * Each bucket (block/direct/proxy) is emitted as a small set of single-matcher rules (one per field
+ * type) so the result is unambiguous regardless of sing-box's cross-field matching semantics — the
+ * combined geoip+geosite rule-set rule mirrors the proven shipped form. Rules are ordered by
+ * [RoutingProfile.routeOrder].
+ */
+object SingBoxRouting {
+
+    const val PROXY_TAG = "proxy"
+    const val DIRECT_TAG = "direct"
+
+    /**
+     * Outbound used to fetch remote `.srs` rule-sets — the PROXY, not `direct`.
+     *
+     * The sets live on raw.githubusercontent.com, which is blocked in exactly the places this app is
+     * used. And a failed initial fetch is not a soft failure: sing-box's RemoteRuleSet.StartContext
+     * returns `initial rule-set: <tag>` and the WHOLE CORE REFUSES TO START, so a profile with any
+     * geosite:/geoip: selector could take the connection down with it. Downloading through the tunnel
+     * removes the dependency on the censored path; combined with experimental.cache_file (which
+     * persists fetched rule-sets) later starts need no network for this at all.
+     */
+    const val RULE_SET_DOWNLOAD_TAG = PROXY_TAG
+
+    const val DEFAULT_GEOSITE_BASE = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/"
+    const val DEFAULT_GEOIP_BASE = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/"
+
+    /** Parsed split of a bucket's selectors into sing-box matcher dimensions. */
+    private data class Selectors(
+        val domainSuffix: List<String>,
+        val domainExact: List<String>,
+        val domainKeyword: List<String>,
+        val domainRegex: List<String>,
+        val ipCidr: List<String>,
+        val geositeTags: List<String>,
+        val geoipTags: List<String>,
+    )
+
+    /**
+     * The route rules for [profile], ordered by its routeOrder. Caller inserts these after `sniff`.
+     *
+     * [hideDirectIpv6]: in the hybrid IPv6 modes (prefer_ipv4/prefer_ipv6) the user wants bypass/direct
+     * sites (geosite:ru / domain:ru) to NEVER egress over the real IPv6 — the direct outbound's
+     * `domain_strategy: ipv4_only` re-resolves sniffed domains to A, but a raw-IPv6 / app-own-DoH
+     * connection with no SNI can slip past it. When true, we prepend a REJECT for IPv6 connections to
+     * the direct bucket's matchers (ip_version 6), so direct sites are hard-pinned to IPv4 while
+     * proxied traffic keeps its dual-stack. (ipv4_only already rejects ::/0 globally; ipv6_only wants
+     * v6 — so the caller only sets this for the prefer_* hybrids.)
+     */
+    /**
+     * [directTag] is normally [DIRECT_TAG], but a tunnel that must never be bypassed (VK-TURN /
+     * MasterDNS / olcRTC with `directViaBase`) passes its base tunnel's tag instead: sing-box 1.14 forbids
+     * a `detour` on the `direct` outbound, so the "direct" bucket is pointed at the tunnel by TAG.
+     */
+    fun rules(
+        profile: RoutingProfile,
+        hideDirectIpv6: Boolean = false,
+        directTag: String = DIRECT_TAG,
+    ): JsonArray = buildJsonArray {
+        val order = profile.routeOrder.split('-')
+            .map { it.trim().lowercase() }
+            .filter { it in RoutingProfile.DEFAULT_ORDER }
+            .ifEmpty { RoutingProfile.DEFAULT_ORDER }
+        for (bucket in order) {
+            when (bucket) {
+                "block" -> emitBucket(profile.blockSites, profile.blockIp, reject = true, outbound = null)
+                "direct" -> {
+                    // Reject IPv6 to the direct sites FIRST (so v6 never bypasses over real IPv6), then
+                    // route the (IPv4) direct connections out the direct outbound.
+                    if (hideDirectIpv6) {
+                        emitBucket(profile.directSites, profile.directIp, reject = true, outbound = null, ipVersion = 6)
+                    }
+                    emitBucket(profile.directSites, profile.directIp, reject = false, outbound = directTag)
+                }
+                "proxy" -> emitBucket(profile.proxySites, profile.proxyIp, reject = false, outbound = PROXY_TAG)
+            }
+        }
+    }
+
+    /** The final outbound when nothing matches: proxy for a global proxy, direct otherwise. */
+    fun finalOutbound(profile: RoutingProfile, directTag: String = DIRECT_TAG): String =
+        if (profile.globalProxy) PROXY_TAG else directTag
+
+    /**
+     * The `rule_set` definitions for every geo tag the profile references, as remote `.srs` entries.
+     * Returns an empty array when the profile uses no geo selectors.
+     */
+    fun ruleSets(
+        profile: RoutingProfile,
+        geositeBase: String = DEFAULT_GEOSITE_BASE,
+        geoipBase: String = DEFAULT_GEOIP_BASE,
+    ): JsonArray {
+        val site = parse(profile.blockSites) + parse(profile.directSites) + parse(profile.proxySites)
+        val ip = parseIp(profile.blockIp) + parseIp(profile.directIp) + parseIp(profile.proxyIp)
+        val geositeTags = site.flatMap { it.geositeTags }.distinct()
+        val geoipTags = ip.flatMap { it.geoipTags }.distinct()
+        if (geositeTags.isEmpty() && geoipTags.isEmpty()) return JsonArray(emptyList())
+        val siteBase = geositeBase.ifBlank { DEFAULT_GEOSITE_BASE }.let { if (it.endsWith('/')) it else "$it/" }
+        val ipBase = geoipBase.ifBlank { DEFAULT_GEOIP_BASE }.let { if (it.endsWith('/')) it else "$it/" }
+        return buildJsonArray {
+            geositeTags.forEach { tag ->
+                addJsonObject {
+                    put("type", "remote")
+                    put("tag", "geosite-$tag")
+                    put("format", "binary")
+                    put("url", "${siteBase}geosite-$tag.srs")
+                    put("download_detour", RULE_SET_DOWNLOAD_TAG)
+                }
+            }
+            geoipTags.forEach { tag ->
+                addJsonObject {
+                    put("type", "remote")
+                    put("tag", "geoip-$tag")
+                    put("format", "binary")
+                    put("url", "${ipBase}geoip-$tag.srs")
+                    put("download_detour", RULE_SET_DOWNLOAD_TAG)
+                }
+            }
+        }
+    }
+
+    // --- v2rayNG-style manual rules (sing-box only) ---
+
+    /**
+     * One sing-box `route.rules` object per enabled [SingBoxRule]. All of a rule's populated fields
+     * are combined into a single object (sing-box ANDs the fields), mirroring v2rayNG semantics.
+     * Caller inserts these into `route.rules`.
+     */
+    fun manualRules(
+        rules: List<SingBoxRule>,
+        matchAppsByProcess: Boolean = false,
+        directTag: String = DIRECT_TAG,
+    ): JsonArray = buildJsonArray {
+        rules.filter { it.enabled && it.hasMatcher() }.forEach { rule ->
+            val s = parse(rule.domains)
+            val i = parseIp(rule.ip)
+            val domainSuffix = s.flatMap { it.domainSuffix }.distinct()
+            val domainExact = s.flatMap { it.domainExact }.distinct()
+            val domainKeyword = s.flatMap { it.domainKeyword }.distinct()
+            val domainRegex = s.flatMap { it.domainRegex }.distinct()
+            val ipCidr = i.flatMap { it.ipCidr }.distinct()
+            val sourceIpCidr = parseIp(rule.source).flatMap { it.ipCidr }.distinct()
+            val ruleSetTags = (s.flatMap { it.geositeTags }.map { "geosite-$it" } +
+                i.flatMap { it.geoipTags }.map { "geoip-$it" }).distinct()
+            val singlePorts = mutableListOf<Int>()
+            val portRanges = mutableListOf<String>()
+            splitPorts(rule.port, singlePorts, portRanges)
+            val srcSinglePorts = mutableListOf<Int>()
+            val srcPortRanges = mutableListOf<String>()
+            splitPorts(rule.sourcePort, srcSinglePorts, srcPortRanges)
+
+            add(buildJsonObject {
+                if (ruleSetTags.isNotEmpty()) putJsonArray("rule_set") { ruleSetTags.forEach { add(it) } }
+                if (domainSuffix.isNotEmpty()) putJsonArray("domain_suffix") { domainSuffix.forEach { add(it) } }
+                if (domainExact.isNotEmpty()) putJsonArray("domain") { domainExact.forEach { add(it) } }
+                if (domainKeyword.isNotEmpty()) putJsonArray("domain_keyword") { domainKeyword.forEach { add(it) } }
+                if (domainRegex.isNotEmpty()) putJsonArray("domain_regex") { domainRegex.forEach { add(it) } }
+                if (ipCidr.isNotEmpty()) putJsonArray("ip_cidr") { ipCidr.forEach { add(it) } }
+                if (sourceIpCidr.isNotEmpty()) putJsonArray("source_ip_cidr") { sourceIpCidr.forEach { add(it) } }
+                if (singlePorts.isNotEmpty()) putJsonArray("port") { singlePorts.forEach { add(it) } }
+                if (portRanges.isNotEmpty()) putJsonArray("port_range") { portRanges.forEach { add(it) } }
+                if (srcSinglePorts.isNotEmpty()) putJsonArray("source_port") { srcSinglePorts.forEach { add(it) } }
+                if (srcPortRanges.isNotEmpty()) putJsonArray("source_port_range") { srcPortRanges.forEach { add(it) } }
+                if (rule.network.isNotBlank()) put("network", rule.network)
+                if (rule.networkType.isNotEmpty()) putJsonArray("network_type") { rule.networkType.forEach { add(it) } }
+                if (rule.protocol.isNotEmpty()) putJsonArray("protocol") { rule.protocol.forEach { add(it) } }
+                if (rule.client.isNotEmpty()) putJsonArray("client") { rule.client.forEach { add(it) } }
+                if (rule.networkIsExpensive) put("network_is_expensive", true)
+                if (rule.clashMode.isNotBlank()) put("clash_mode", rule.clashMode)
+                // sing-box's `package_name` resolves an Android UID and can never match on desktop;
+                // there the same "which app" intent is expressed as `process_name` (an exe name).
+                if (rule.packageNames.isNotEmpty()) {
+                    putJsonArray(if (matchAppsByProcess) "process_name" else "package_name") {
+                        rule.packageNames.forEach { add(it) }
+                    }
+                }
+                when (rule.action) {
+                    SingBoxRule.ACTION_REJECT -> put("action", "reject")
+                    SingBoxRule.ACTION_HIJACK_DNS -> put("action", "hijack-dns")
+                    SingBoxRule.ACTION_SNIFF -> put("action", "sniff")
+                    SingBoxRule.ACTION_RESOLVE -> put("action", "resolve")
+                    SingBoxRule.ACTION_ROUTE_OPTIONS -> put("action", "route-options")
+                    // ACTION_ROUTE (default): route to the chosen outbound (block → reject).
+                    else -> when (rule.outbound) {
+                        SingBoxRule.OUT_BLOCK -> put("action", "reject")
+                        SingBoxRule.OUT_DIRECT -> put("outbound", directTag)
+                        else -> put("outbound", PROXY_TAG)
+                    }
+                }
+            })
+        }
+    }
+
+    /** Remote `.srs` rule-sets for every geo tag the [rules] reference. Empty when none. */
+    fun manualRuleSets(
+        rules: List<SingBoxRule>,
+        geositeBase: String = DEFAULT_GEOSITE_BASE,
+        geoipBase: String = DEFAULT_GEOIP_BASE,
+    ): JsonArray {
+        val enabled = rules.filter { it.enabled && it.hasMatcher() }
+        val geositeTags = enabled.flatMap { parse(it.domains).flatMap(Selectors::geositeTags) }.distinct()
+        val geoipTags = enabled.flatMap { parseIp(it.ip).flatMap(Selectors::geoipTags) }.distinct()
+        if (geositeTags.isEmpty() && geoipTags.isEmpty()) return JsonArray(emptyList())
+        val siteBase = geositeBase.ifBlank { DEFAULT_GEOSITE_BASE }.let { if (it.endsWith('/')) it else "$it/" }
+        val ipBase = geoipBase.ifBlank { DEFAULT_GEOIP_BASE }.let { if (it.endsWith('/')) it else "$it/" }
+        return buildJsonArray {
+            geositeTags.forEach { tag ->
+                addJsonObject {
+                    put("type", "remote"); put("tag", "geosite-$tag"); put("format", "binary")
+                    put("url", "${siteBase}geosite-$tag.srs"); put("download_detour", RULE_SET_DOWNLOAD_TAG)
+                }
+            }
+            geoipTags.forEach { tag ->
+                addJsonObject {
+                    put("type", "remote"); put("tag", "geoip-$tag"); put("format", "binary")
+                    put("url", "${ipBase}geoip-$tag.srs"); put("download_detour", RULE_SET_DOWNLOAD_TAG)
+                }
+            }
+        }
+    }
+
+    /** Splits a port field ("443, 1000:2000, 8080") into single ints and "lo:hi" ranges. */
+    private fun splitPorts(raw: String, single: MutableList<Int>, ranges: MutableList<String>) {
+        raw.split(',', ';', ' ', '\n').map { it.trim() }.filter { it.isNotEmpty() }.forEach { tok ->
+            if (tok.contains(':') || tok.contains('-')) {
+                val parts = tok.split(':', '-').map { it.trim() }
+                if (parts.size == 2 && parts[0].toIntOrNull() != null && parts[1].toIntOrNull() != null) {
+                    ranges.add("${parts[0]}:${parts[1]}")
+                }
+            } else {
+                tok.toIntOrNull()?.let { single.add(it) }
+            }
+        }
+    }
+
+    // --- internals ---
+
+    private fun kotlinx.serialization.json.JsonArrayBuilder.emitBucket(
+        sites: List<String>,
+        ips: List<String>,
+        reject: Boolean,
+        outbound: String?,
+        // When set, the emitted rules also match `ip_version` (e.g. 6) — used to reject IPv6 to the
+        // direct bucket while leaving the IPv4 direct rules untouched.
+        ipVersion: Int? = null,
+    ) {
+        val s = parse(sites)
+        val i = parseIp(ips)
+        val domainSuffix = s.flatMap { it.domainSuffix }.distinct()
+        val domainExact = s.flatMap { it.domainExact }.distinct()
+        val domainKeyword = s.flatMap { it.domainKeyword }.distinct()
+        val domainRegex = s.flatMap { it.domainRegex }.distinct()
+        val ipCidr = i.flatMap { it.ipCidr }.distinct()
+        val geositeTags = s.flatMap { it.geositeTags }.distinct()
+        val geoipTags = i.flatMap { it.geoipTags }.distinct()
+
+        // Geo rule-sets (geosite + geoip) combined into one OR-matched rule (proven shipped form).
+        if (geositeTags.isNotEmpty() || geoipTags.isNotEmpty()) {
+            add(matchRule(reject, outbound, ipVersion) {
+                putJsonArray("rule_set") {
+                    geositeTags.forEach { add("geosite-$it") }
+                    geoipTags.forEach { add("geoip-$it") }
+                }
+            })
+        }
+        if (domainSuffix.isNotEmpty()) add(matchRule(reject, outbound, ipVersion) { putJsonArray("domain_suffix") { domainSuffix.forEach { add(it) } } })
+        if (domainExact.isNotEmpty()) add(matchRule(reject, outbound, ipVersion) { putJsonArray("domain") { domainExact.forEach { add(it) } } })
+        if (domainKeyword.isNotEmpty()) add(matchRule(reject, outbound, ipVersion) { putJsonArray("domain_keyword") { domainKeyword.forEach { add(it) } } })
+        if (domainRegex.isNotEmpty()) add(matchRule(reject, outbound, ipVersion) { putJsonArray("domain_regex") { domainRegex.forEach { add(it) } } })
+        // An IPv6-reject pass over IPv4-only ip_cidr entries would never match; skip it to avoid noise.
+        if (ipCidr.isNotEmpty() && ipVersion == null) add(matchRule(reject, outbound, null) { putJsonArray("ip_cidr") { ipCidr.forEach { add(it) } } })
+    }
+
+    private inline fun matchRule(reject: Boolean, outbound: String?, ipVersion: Int? = null, matcher: JsonObjectBuilder.() -> Unit): JsonObject =
+        buildJsonObject {
+            matcher()
+            if (ipVersion != null) put("ip_version", ipVersion)
+            if (reject) put("action", "reject") else put("outbound", outbound ?: PROXY_TAG)
+        }
+
+    private fun parse(selectors: List<String>): List<Selectors> = selectors.mapNotNull { raw ->
+        val v = raw.trim()
+        if (v.isEmpty()) return@mapNotNull null
+        when {
+            v.startsWith("geosite:", true) -> sel(geosite = listOf(v.substringAfter(':').trim().lowercase()))
+            v.startsWith("geoip:", true) -> sel(geoip = listOf(v.substringAfter(':').trim().lowercase()))
+            // v2ray/Xray `domain:` = match the domain itself AND any subdomain. sing-box has no
+            // single equivalent: domain_suffix is a RAW string suffix (so "ru" would also match
+            // "metaru", and miss the bare label nuance). Emit exact + dotted-suffix to mirror Xray:
+            // `domain:ru` → domain "ru" + domain_suffix ".ru" (all *.ru, not "centaur").
+            v.startsWith("domain:", true) -> domainAndSubdomains(v.substringAfter(':').trim())
+            v.startsWith("full:", true) -> sel(exact = listOf(v.substringAfter(':').trim()))
+            v.startsWith("keyword:", true) -> sel(keyword = listOf(v.substringAfter(':').trim()))
+            v.startsWith("regexp:", true) || v.startsWith("regex:", true) -> sel(regex = listOf(v.substringAfter(':').trim()))
+            isCidrOrIp(v) -> sel(cidr = listOf(toCidr(v)))
+            else -> domainAndSubdomains(v)
+        }
+    }
+
+    /**
+     * Mirrors v2ray/Xray `domain:` semantics on sing-box: the exact label plus a dotted suffix so
+     * `ru` matches `ru` and `*.ru` (never `metaru`), and `google.com` matches it and its subdomains
+     * (never `evilgoogle.com`). A value that already starts with `.` is treated as suffix-only.
+     */
+    private fun domainAndSubdomains(value: String): Selectors {
+        val v = value.trim()
+        if (v.isEmpty()) return sel()
+        if (v.startsWith(".")) return sel(suffix = listOf(v))
+        return sel(exact = listOf(v), suffix = listOf(".$v"))
+    }
+
+    private fun parseIp(selectors: List<String>): List<Selectors> = selectors.mapNotNull { raw ->
+        val v = raw.trim()
+        if (v.isEmpty()) return@mapNotNull null
+        when {
+            v.startsWith("geoip:", true) -> sel(geoip = listOf(v.substringAfter(':').trim().lowercase()))
+            v.startsWith("geosite:", true) -> sel(geosite = listOf(v.substringAfter(':').trim().lowercase()))
+            // `asn:` selectors are expanded to CIDRs before config build; ignore any that slipped
+            // through unresolved so they never become a malformed `ip_cidr` entry.
+            org.olcbox.app.data.model.Asn.isSelector(v) -> null
+            else -> sel(cidr = listOf(toCidr(v)))
+        }
+    }
+
+    private fun sel(
+        suffix: List<String> = emptyList(),
+        exact: List<String> = emptyList(),
+        keyword: List<String> = emptyList(),
+        regex: List<String> = emptyList(),
+        cidr: List<String> = emptyList(),
+        geosite: List<String> = emptyList(),
+        geoip: List<String> = emptyList(),
+    ) = Selectors(suffix, exact, keyword, regex, cidr, geosite, geoip)
+
+    private fun isCidrOrIp(v: String): Boolean =
+        v.contains('/') || v.count { it == ':' } >= 2 || v.matches(Regex("""\d{1,3}(\.\d{1,3}){3}"""))
+
+    /** sing-box `ip_cidr` wants a CIDR; a bare address becomes a /32 (v4) or /128 (v6). */
+    private fun toCidr(v: String): String {
+        if (v.contains('/')) return v
+        return if (v.contains(':')) "$v/128" else "$v/32"
+    }
+}
+
+private typealias JsonObjectBuilder = kotlinx.serialization.json.JsonObjectBuilder

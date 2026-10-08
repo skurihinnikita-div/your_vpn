@@ -1,0 +1,23 @@
+# --- Local-only working data: never publish ---
+# Reference material, UI mockups and ready-to-distribute builds live outside the source tree.
+/Данные для ИИ/
+/Интерфейс/
+/deliverables/
+
+# The sample catalogue points at real servers/keys — keep it local.
+/Пример.json
+
+# --- Editors ---
+.vscode/
+.idea/
+*.iml
+
+# --- Secrets (also handled by olcvpn-client-main/.gitignore, kept here for safety) ---
+**/local.properties
+**/keystore.properties
+*.jks
+*.keystore
+
+# --- OS ---
+.DS_Store
+Thumbs.db

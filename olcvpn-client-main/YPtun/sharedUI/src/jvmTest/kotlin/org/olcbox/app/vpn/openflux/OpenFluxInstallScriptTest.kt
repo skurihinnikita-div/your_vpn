@@ -1,0 +1,60 @@
+package org.olcbox.app.vpn.openflux
+
+import org.olcbox.app.data.model.OpenFluxConfig
+import kotlin.test.Test
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+
+class OpenFluxInstallScriptTest {
+    // A real Yandex Docs link is full of %XX (systemd unit specifiers) and may carry & and $.
+    private val url = "https://docs.yandex.ru/docs/view?url=ya-disk-public%3A%2F%2Fabc&name=a\"b\$c"
+
+    @Test
+    fun carrierSecretsLiveInTheEnvironmentFileNotOnTheCommandLine() {
+        val script = buildOpenFluxInstallScript(
+            OpenFluxInstallOptions(host = "203.0.113.7", sshPassword = "x", docUrl = url)
+        )
+        val execStart = script.lines().single { it.startsWith("ExecStart=") }
+        assertFalse("%3A" in execStart, execStart)
+        assertTrue(execStart.endsWith("--transport \${OPENFLUX_TRANSPORT} --url \${OPENFLUX_DOC_URL}"), execStart)
+        // Double-quoted, with the quote escaped; the quoted heredoc keeps $ literal.
+        assertTrue(script.lines().any { it == "OPENFLUX_DOC_URL=\"${url.replace("\"", "\\\"")}\"" }, script)
+        assertTrue("<<'ENVFILE'" in script && "<<'UNIT'" in script)
+    }
+
+    @Test
+    fun l4ExitReplacesOldInstallAndDropsRstRule() {
+        val script = buildOpenFluxInstallScript(
+            OpenFluxInstallOptions(
+                host = "203.0.113.7", sshPassword = "x",
+                transport = OpenFluxConfig.TRANSPORT_MAX, exitMaxToken = "tok",
+            )
+        )
+        // l4 exit: no host-wide RST drop any more; a leftover rule from an old install is removed.
+        assertFalse(script.lines().any { it.startsWith("ExecStartPre=") })
+        assertTrue("while iptables -D OUTPUT -p tcp --tcp-flags RST RST -j DROP" in script)
+        assertTrue("systemctl disable --now openflux" in script)
+        assertTrue("--mode=l4" in script)
+        assertTrue(script.lines().any { it == "OPENFLUX_TRANSPORT=\"oneme\"" })
+        assertTrue(script.lines().any { it == "OPENFLUX_MAX_TOKEN=\"tok\"" })
+        val execStart = script.lines().single { it.startsWith("ExecStart=") }
+        assertTrue(execStart.endsWith("--transport \${OPENFLUX_TRANSPORT}"), execStart)
+        assertFalse("--url" in execStart, "MAX transport should not have --url on ExecStart: $execStart")
+    }
+
+    /** The node must run the SAME transport as the client — the new-editor one used to collapse to "yandex". */
+    @Test
+    fun newEditorTransportReachesTheNodeWithItsDocument() {
+        val script = buildOpenFluxInstallScript(
+            OpenFluxInstallOptions(
+                host = "203.0.113.7", sshPassword = "x",
+                transport = OpenFluxConfig.TRANSPORT_VYANDEX, docUrl = url,
+            )
+        )
+        assertTrue(script.lines().any { it == "OPENFLUX_TRANSPORT=\"vyandex\"" }, script)
+        val execStart = script.lines().single { it.startsWith("ExecStart=") }
+        assertTrue(execStart.endsWith("--transport \${OPENFLUX_TRANSPORT} --url \${OPENFLUX_DOC_URL}"), execStart)
+        assertTrue(OpenFluxConfig(transport = "vyandex").normalized().transport == "vyandex")
+        assertTrue(OpenFluxConfig(transport = "bogus").normalized().transport == OpenFluxConfig.TRANSPORT_YANDEX)
+    }
+}

@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:tools="http://schemas.android.com/tools"
+    xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Trust Tunnel AAR declares minSdk 26; the app stays minSdk 23. On API 23–25 the TrustTunnel
+         engine is unavailable (its native client needs 26+), but the rest of the app runs normally. -->
+    <uses-sdk tools:overrideLibrary="com.adguard.trusttunnel" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Ask to be exempted from Doze/battery optimization so the VPN foreground service survives long
+         (24h+) screen-off sessions instead of being throttled/killed — the usual reason a tunnel drops
+         overnight. Requested from Settings, never silently. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Split tunneling needs to enumerate ALL installed apps (incl. system/background packages with
+         no launcher icon) so they can be included in / excluded from the tunnel. Distributed outside
+         Google Play, so the QUERY_ALL_PACKAGES policy restriction doesn't apply. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <!-- Перенос данных при смене applicationId (org.olcbox.app -> новый id, см. LegacyMigration).
+         Имя права ОДНО на обе сборки: signature-уровень означает, что читать провайдер старой
+         установки может только APK с нашей подписью. Объявляем и запрашиваем в обеих сборках -
+         вторая установка с тем же именем права и той же подписью системе не мешает. -->
+    <permission
+        android:name="org.olcbox.app.permission.MIGRATION"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="org.olcbox.app.permission.MIGRATION" />
+
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".App"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="your_vpn"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.YPtun"
+        android:usesCleartextTraffic="true">
+
+        <!-- Use our bundled EmojiCompat (init in App.onCreate) instead of the default
+             downloadable-font initializer, so flag emojis render offline/everywhere.
+             Also disable WorkManager's automatic startup initializer: it runs as a
+             ContentProvider BEFORE Application.onCreate (uncatchable), so instead the app
+             initializes WorkManager on-demand via Configuration.Provider, guarded in onCreate. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+                tools:node="remove" />
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                tools:node="remove" />
+        </provider>
+
+        <activity
+            android:name=".AppActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:launchMode="singleInstance"
+            android:windowSoftInputMode="adjustPan"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Deep links: yptun://import/{url|config}, yptun://control/{start|stop|restart} -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="yourvpn" />
+            </intent-filter>
+            <!--
+                Long-pressing the Quick Settings tile launches the tile's
+                "preferences" activity. Without this filter the system falls
+                back to the App Info settings page; handling it here makes a
+                long-press reliably open the app instead.
+            -->
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+            </intent-filter>
+            <!-- «Включить / Выключить / Вкл/выкл VPN»: long-press on the icon and Samsung Routines app actions. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+        </activity>
+
+        <!-- Invisible target of those shortcuts: switches the VPN and finishes (see VpnShortcutActivity). -->
+        <activity
+            android:name=".VpnShortcutActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <activity
+            android:name="org.olcbox.app.ui.activities.QrScannerActivity"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- Отдаёт состояние приложения новой сборке при переезде на другой applicationId.
+             exported, но за signature-правом: чужой APK его не прочитает. -->
+        <provider
+            android:name="org.olcbox.app.migration.LegacyExportProvider"
+            android:authorities="${applicationId}.migration"
+            android:exported="true"
+            android:permission="org.olcbox.app.permission.MIGRATION" />
+
+        <activity
+            android:name="org.olcbox.app.vpn.service.CaptchaActivity"
+            android:theme="@android:style/Theme.DeviceDefault.Light.Dialog"
+            android:excludeFromRecents="true"
+            android:exported="false" />
+
+        <service
+            android:name="org.olcbox.app.vpn.service.OlcboxVpnService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn" />
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
+        <!--
+            Telegram-over-WARP background proxy: a separate lightweight foreground service that runs an
+            AmneziaWG (Cloudflare WARP) tunnel and exposes a local SOCKS5 the user points Telegram at.
+            Independent of the VPN service.
+        -->
+        <service
+            android:name="org.olcbox.app.vpn.telegram.TelegramProxyService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="WARP proxy for Telegram" />
+        </service>
+
+        <!--
+            Quick Settings tile — allows the user to toggle the VPN directly
+            from the notification shade without opening the app.
+            Requires Android 7.0+ (API 24). The tile must be added manually by
+            the user via "Edit" in the Quick Settings panel.
+        -->
+        <service
+            android:name=".QuickSettingsTileService"
+            android:label="@string/qs_tile_label"
+            android:icon="@drawable/ic_qs_tile_cat"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true"
+            tools:targetApi="24">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
+        </service>
+
+        <!--
+            Home-screen widgets. The running VPN service repaints them by sending an explicit
+            ACTION_WIDGET_REFRESH broadcast (no intent-filter needed for explicit/same-app delivery).
+        -->
+        <!-- Per-instance widget appearance (theme / opacity / corners / accent / visible parts). -->
+        <activity
+            android:name=".widget.WidgetConfigActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:label="@string/widget_config_label"
+            android:theme="@style/Theme.YPtun">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".widget.ToggleWidgetProvider"
+            android:label="@string/widget_toggle_label"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_toggle_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.StatusWidgetProvider"
+            android:label="@string/widget_status_description"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_status_info" />
+        </receiver>
+
+    </application>
+
+</manifest>
